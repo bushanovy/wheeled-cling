@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+  <model name="horizontal_pipe">
+    <static>true</static>
+
+    <link name="pipe_link">
+      <collision name="pipe_collision">
+        <!-- Gazebo cylinders are Z-axis aligned by default. Rotating the link
+             90 deg about Y makes this pipe run horizontally along world X. -->
+        <pose>0 0 0 0 1.57079632679 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>1.20</radius>
+            <length>6.00</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1.6</mu>
+              <mu2>1.6</mu2>
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <kp>250000</kp>
+              <kd>80</kd>
+              <max_vel>0.20</max_vel>
+              <min_depth>0.006</min_depth>
+            </ode>
+          </contact>
+        </surface>
+      </collision>
+
+      <visual name="pipe_visual">
+        <pose>0 0 0 0 1.57079632679 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>1.20</radius>
+            <length>6.00</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.55 0.58 0.60 1</ambient>
+          <diffuse>0.68 0.72 0.74 1</diffuse>
+          <specular>0.35 0.35 0.35 1</specular>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

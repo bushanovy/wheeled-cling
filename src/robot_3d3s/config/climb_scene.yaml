@@ -1,0 +1,89 @@
+# =============================================================================
+# climb_scene.yaml — SINGLE SOURCE OF TRUTH for the 3D3S climbing simulation.
+#
+# This one file defines the scene geometry, the robot spawn rule, and the
+# magnetic-adhesion model. The launch files generate the Gazebo world AND the
+# RViz markers AND the C++ adhesion-plugin parameters from these numbers, so
+# the wall is in *exactly* the same place in Gazebo and RViz, and the adhesion
+# gap is measured against the same surface Gazebo actually simulates.
+#
+# Edit geometry here only. Do not hand-edit the world SDF or duplicate these
+# numbers into launch files.
+#
+# Frames/units: world frame, meters, radians. +Z is up. Gravity -Z.
+# =============================================================================
+
+world_name: flat_wall
+
+# ---------------------------------------------------------------------------
+# Ground steel plate (z = 0 plane). Ferromagnetic so the robot can sit/drive
+# on it before a climb. Friction mu is steel-on-rubber-ish.
+# ---------------------------------------------------------------------------
+ground:
+  z: 0.0
+  mu: 1.0
+
+# ---------------------------------------------------------------------------
+# Flat vertical steel wall (the Stage-1 test surface).
+#
+#   pose    : world XYZ of the box CENTER
+#   size    : box extents [thickness_x, width_y, height_z]
+#   climb_face: which face the robot climbs. "-x" => the lower-X face, whose
+#               outward normal points in -X, i.e. the robot sits on the -X side.
+#
+# Derived (computed in the launch, never hand-typed elsewhere):
+#   face_x   = pose.x - size.x/2      (for climb_face "-x")
+#   normal   = (-1, 0, 0)             (outward from the climbed face)
+# ---------------------------------------------------------------------------
+flat_wall:
+  pose: [1.0, 0.0, 1.5]
+  size: [0.10, 3.0, 3.0]
+  climb_face: "-x"
+  mu: 1.0
+
+# ---------------------------------------------------------------------------
+# Robot spawn rule for the flat wall. The launch computes the spawn pose from
+# the wall geometry so the three wheels land coplanar on the climbed face:
+#
+#   spawn.x   = face_x + preload_m     (small +preload presses wheels in)
+#   spawn.y   = flat_wall.pose.y
+#   spawn.z   = start_height_z         (where up the wall to begin)
+#   spawn RPY = (0, -pi/2, 0)          (body +Z -> world -X = off the wall;
+#                                       body +X "forward" -> world +Z = up)
+#
+# So "drive forward" climbs UP the wall. No magic Euler numbers anywhere.
+# ---------------------------------------------------------------------------
+robot:
+  name: robot_3d3s
+  wheel_radius: 0.05
+  circumradius: 0.41405      # wheel-contact radius from base center
+  mass: 8.715                # base + 3*(steering+wheel); used by adhesion_report
+  preload_m: 0.0             # wheel pre-penetration into the wall at spawn
+  start_height_z: 1.5        # world Z of base_footprint at spawn (wall center)
+
+# ---------------------------------------------------------------------------
+# Magnetic adhesion model (per wheel), fed straight into the C++ plugin.
+#
+# Force-vs-gap is OmniClimbers Eq.(1) / HKCM:  F = F0 / (1 + (gap/gap_ref)^3)
+# Force-vs-tilt is OmniClimbers Fig.10: ~100% aligned, floors near 45-60 deg,
+# recovers toward ~55% at 90 deg (front+lateral pole). NEVER drops to zero.
+#
+# KMW100 reference: ~900 N at zero gap on saturated (>=5 mm) steel.
+# ---------------------------------------------------------------------------
+adhesion:
+  model: gap_decay           # gap_decay (Eq.1) | constant
+  force_n: 900.0             # F0, full-contact zero-gap force per wheel
+  min_force_n: 0.0
+  min_wall_force_n: 350.0    # safety floor on a confirmed wall contact (N)
+  gap_reference_mm: 3.0      # characteristic decay length s0 in Eq.(1)
+  gap_bias_mm: 0.0
+  max_gap_m: 0.06            # beyond this gap a wheel is "detached"
+  full_contact_depth_m: 0.002
+  min_contact_fraction: 0.10
+  # OmniClimbers Fig.10 tilt curve:
+  tilt_floor: 0.45           # minimum fraction at the worst tilt (~45-60 deg)
+  tilt_recovery_90: 0.55     # fraction recovered at 90 deg (lateral pole)
+  # surfaces active for THIS scene (flat wall only):
+  enable_ground: false
+  enable_slide: false
+  enable_opposite_wall: false

@@ -1,0 +1,52 @@
+<?xml version="1.0" ?>
+<sdf version="1.8">
+  <world name="adhesion_model_test">
+    <gravity>0 0 -9.8</gravity>
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-apply-link-wrench-system" name="gz::sim::systems::ApplyLinkWrench"/>
+    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="steel_vertical_pipe">
+      <static>true</static>
+      <pose>0.0 0.0 2.0 0 0 0</pose>
+      <link name="pipe_link">
+        <collision name="steel_vertical_pipe_collision">
+          <geometry><cylinder><radius>1.20</radius><length>4.0</length></cylinder></geometry>
+          <surface>
+            <friction><ode><mu>1.6</mu><mu2>1.6</mu2></ode></friction>
+            <contact>
+              <ode>
+                <kp>250000</kp>
+                <kd>80</kd>
+                <max_vel>0.20</max_vel>
+                <min_depth>0.006</min_depth>
+              </ode>
+            </contact>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>1.20</radius><length>4.0</length></cylinder></geometry>
+          <material>
+            <ambient>0.12 0.12 0.20 1</ambient>
+            <diffuse>0.24 0.24 0.52 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>

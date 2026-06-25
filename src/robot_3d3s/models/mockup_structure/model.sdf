@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="mockup_structure">
+
+    <!-- Static: the structure is fixed to the world, no physics integration. -->
+    <static>true</static>
+
+    <link name="structure_link">
+
+      <!-- Visual mesh: fine resolution, what you see in the GUI. -->
+      <visual name="visual">
+        <geometry>
+          <mesh>
+            <uri>model://mockup_structure/meshes/mockup_structure_visual.dae</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.63 0.07 0.08 1</ambient>
+          <diffuse>0.70 0.08 0.08 1</diffuse>
+          <specular>0.20 0.20 0.20 1</specular>
+        </material>
+      </visual>
+
+      <!-- Collision mesh: coarse resolution, used by the physics engine
+           for contact with the robot. Lighter than the visual mesh. -->
+      <collision name="collision">
+        <geometry>
+          <mesh>
+            <uri>model://mockup_structure/meshes/mockup_structure_collision.dae</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1.0</mu>
+              <mu2>1.0</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+
+    </link>
+  </model>
+</sdf>

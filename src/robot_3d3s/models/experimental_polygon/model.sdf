@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+  <model name="experimental_polygon">
+    <static>true</static>
+
+    <!-- Experimental polygon dimensions:
+         left vertical pipe:  radius 457.2 mm, height 3000 mm
+         right vertical pipe: radius 254.0 mm, height 3000 mm
+         horizontal pipe:     radius 254.0 mm, centerline height 1246 mm
+
+         The horizontal pipe overlaps into both vertical pipes to avoid a visual
+         and collision gap at the junction.  Its endpoints are placed at the two
+         vertical pipe centerlines, so the overlap depths are 457.2 mm at the
+         left pipe and 254.0 mm at the right pipe.
+    -->
+
+    <link name="structure_link">
+      <collision name="left_vertical_pipe_collision">
+        <pose>-1.5656 0 1.5000 0 0 0</pose>
+        <geometry><cylinder><radius>0.4572</radius><length>3.0000</length></cylinder></geometry>
+        <surface>
+          <friction><ode><mu>1.6</mu><mu2>1.6</mu2></ode></friction>
+          <contact><ode><kp>250000</kp><kd>80</kd><max_vel>0.20</max_vel><min_depth>0.006</min_depth></ode></contact>
+        </surface>
+      </collision>
+
+      <collision name="right_vertical_pipe_collision">
+        <pose>1.5656 0 1.5000 0 0 0</pose>
+        <geometry><cylinder><radius>0.2540</radius><length>3.0000</length></cylinder></geometry>
+        <surface>
+          <friction><ode><mu>1.6</mu><mu2>1.6</mu2></ode></friction>
+          <contact><ode><kp>250000</kp><kd>80</kd><max_vel>0.20</max_vel><min_depth>0.006</min_depth></ode></contact>
+        </surface>
+      </collision>
+
+      <collision name="horizontal_pipe_collision">
+        <pose>0.0000 0 1.2460 0 1.57079632679 0</pose>
+        <geometry><cylinder><radius>0.2540</radius><length>3.1312</length></cylinder></geometry>
+        <surface>
+          <friction><ode><mu>1.6</mu><mu2>1.6</mu2></ode></friction>
+          <contact><ode><kp>250000</kp><kd>80</kd><max_vel>0.20</max_vel><min_depth>0.006</min_depth></ode></contact>
+        </surface>
+      </collision>
+
+      <visual name="left_vertical_pipe_visual">
+        <pose>-1.5656 0 1.5000 0 0 0</pose>
+        <geometry><cylinder><radius>0.4572</radius><length>3.0000</length></cylinder></geometry>
+        <material>
+          <ambient>0.24 0.015 0.018 1</ambient>
+          <diffuse>0.34 0.025 0.030 1</diffuse>
+          <specular>0.18 0.18 0.18 1</specular>
+        </material>
+      </visual>
+
+      <visual name="right_vertical_pipe_visual">
+        <pose>1.5656 0 1.5000 0 0 0</pose>
+        <geometry><cylinder><radius>0.2540</radius><length>3.0000</length></cylinder></geometry>
+        <material>
+          <ambient>0.24 0.015 0.018 1</ambient>
+          <diffuse>0.34 0.025 0.030 1</diffuse>
+          <specular>0.18 0.18 0.18 1</specular>
+        </material>
+      </visual>
+
+      <visual name="horizontal_pipe_visual">
+        <pose>0.0000 0 1.2460 0 1.57079632679 0</pose>
+        <geometry><cylinder><radius>0.2540</radius><length>3.1312</length></cylinder></geometry>
+        <material>
+          <ambient>0.24 0.015 0.018 1</ambient>
+          <diffuse>0.34 0.025 0.030 1</diffuse>
+          <specular>0.18 0.18 0.18 1</specular>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

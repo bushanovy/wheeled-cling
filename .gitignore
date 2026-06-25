@@ -1,0 +1,47 @@
+# --- colcon / ROS build artifacts ---
+build/
+install/
+log/
+.colcon/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- IDE / editor state ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Logs / data recordings ---
+*.bag
+*.db3
+*.log
+
+# --- Local tool / session state (not part of the project) ---
+.claude-flow/
+.swarm/
+.claude/
+.ruvector.db
+robot_glitch_frames/
+
+# --- MCP / IDE config ---
+.mcp.json
+CLAUDE.md
+
+# --- Generated / downloaded deps ---
+.venv/
+venv/
+*.egg-info/
+.pyright_cache/

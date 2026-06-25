@@ -1,0 +1,80 @@
+# Experimental polygon surface graph for surface_goal_planner.py.
+#
+# The polygon in experimental_polygon_test.sdf is a T-junction of three
+# steel pipes:
+#   * left_vertical_pipe:  OD 914.4 mm (R 0.4572 m), height 3.0 m
+#   * right_vertical_pipe: OD 508.0 mm (R 0.2540 m), height 3.0 m
+#   * horizontal_pipe:     OD 508.0 mm (R 0.2540 m), length 3.1312 m
+#
+# The two portal points are the world coordinates where the horizontal
+# pipe intersects the left/right vertical pipes.  At those points the
+# planner can transition from one cylinder to the next.
+#
+# Use:
+#   surface_graph_yaml:=/path/to/experimental_polygon_graph.yaml
+#
+# Units are meters in the world frame. Cylinder coordinates are:
+#   u = axis coordinate, v = angle in radians.
+
+cost_weights:
+  distance: 1.0
+  transition: 1.0
+  adhesion: 2.0
+  edge: 1.5
+  gravity: 1.0
+  turn: 0.25
+  heuristic: 1.0
+  edge_margin_m: 0.10
+
+surfaces:
+  - name: left_vertical_pipe
+    type: cylinder
+    adhesion_quality: 0.95
+    edge_risk: 0.05
+    slip_risk: 0.05
+    transition_risk: 0.10
+    axis: z
+    axis_point: [-1.5656, 0.0, 1.5]
+    radius: 0.4572
+    length: 3.0
+    neighbors: [horizontal_pipe]
+
+  - name: horizontal_pipe
+    type: cylinder
+    adhesion_quality: 0.90
+    edge_risk: 0.10
+    slip_risk: 0.10
+    transition_risk: 0.20
+    axis: x
+    axis_point: [0.0, 0.0, 1.246]
+    radius: 0.2540
+    length: 3.1312
+    neighbors: [left_vertical_pipe, right_vertical_pipe]
+
+  - name: right_vertical_pipe
+    type: cylinder
+    adhesion_quality: 0.90
+    edge_risk: 0.10
+    slip_risk: 0.10
+    transition_risk: 0.20
+    axis: z
+    axis_point: [1.5656, 0.0, 1.5]
+    radius: 0.2540
+    length: 3.0
+    neighbors: [horizontal_pipe]
+
+transitions:
+  - from: left_vertical_pipe
+    to: horizontal_pipe
+    cost: 2.0
+    risk: 0.4
+    # Surface point of the left vertical pipe at the horizontal-pipe
+    # centerline height (z=1.246 m).  The horizontal pipe axis is at
+    # x in [-(0.4572+0.2540), +(0.4572+0.2540)] in world frame.
+    point: [-1.1084, 0.0, 1.246]
+
+  - from: horizontal_pipe
+    to: right_vertical_pipe
+    cost: 2.0
+    risk: 0.4
+    point: [1.3116, 0.0, 1.246]

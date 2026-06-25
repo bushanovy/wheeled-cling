@@ -1,0 +1,54 @@
+# =============================================================================
+# nav2_flat_ground.yaml - OVERLAY on top of nav2_params.yaml for Stage-1
+# flat-ground, edge-safe navigation.
+#
+# Pass this file to every Nav2 node AFTER nav2_params.yaml, e.g.
+#     parameters=[nav2_params.yaml, nav2_flat_ground.yaml, {use_sim_time: True}]
+# Later files override per-leaf, so this only changes what it needs to:
+#
+#   1. Adds a StaticLayer ("static_keepout") to both costmaps. It subscribes to
+#      /keepout_map (from surface_keepout_publisher.py) and marks everything
+#      beyond the surface edges as lethal -> the planner cannot leave the plate.
+#   2. Turns on footprint-aware collision cost in the MPPI CostCritic so the
+#      robot BODY (not just its center) is kept on the surface near an edge.
+#
+# Everything else (controller, planner, inflation, etc.) is inherited unchanged.
+# =============================================================================
+
+controller_server:
+  ros__parameters:
+    FollowPath:
+      CostCritic:
+        consider_footprint: true   # check footprint vs. edges, not just center
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      # Octagon approximating the ~circular 3-wheel body (circumradius 0.414 m).
+      # Required because CostCritic.consider_footprint:true needs a polygon, not
+      # just robot_radius. Overrides robot_radius from the base file.
+      footprint: "[[0.45,0.0],[0.318,0.318],[0.0,0.45],[-0.318,0.318],[-0.45,0.0],[-0.318,-0.318],[0.0,-0.45],[0.318,-0.318]]"
+      # StaticLayer first so InflationLayer (from the base file) inflates it.
+      plugins: ["static_keepout", "inflation_layer"]
+      static_keepout:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /keepout_map
+        subscribe_to_updates: false
+        map_subscribe_transient_local: true
+        transform_tolerance: 0.1
+        enabled: true
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      footprint: "[[0.45,0.0],[0.318,0.318],[0.0,0.45],[-0.318,0.318],[-0.45,0.0],[-0.318,-0.318],[0.0,-0.45],[0.318,-0.318]]"
+      # Rolling window rolls over the static keepout map so edges are honored
+      # locally too (MPPI evaluates trajectories against the local costmap).
+      plugins: ["static_keepout", "inflation_layer"]
+      static_keepout:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /keepout_map
+        subscribe_to_updates: false
+        map_subscribe_transient_local: true
+        transform_tolerance: 0.1
+        enabled: true

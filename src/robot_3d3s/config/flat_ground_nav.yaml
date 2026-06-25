@@ -1,0 +1,31 @@
+# =============================================================================
+# flat_ground_nav.yaml - SINGLE SOURCE OF TRUTH for the Stage-1 flat-ground
+# motion-planning scene and its EDGES.
+#
+# The robot drives on a finite rectangular "steel plate". The plate boundary is
+# the edge it must never cross. surface_keepout_publisher.py reads these numbers
+# and emits an OccupancyGrid where:
+#     inside the plate  -> free   (0)
+#     beyond every edge -> lethal (100)
+# so the Nav2 planner physically cannot return a path that leaves the surface.
+#
+# Frames/units: Nav2 global frame (odom), meters. Edit geometry here only.
+# =============================================================================
+
+frame_id: odom
+
+surface:
+  center: [0.0, 0.0]    # x, y of the traversable plate center (m)
+  size:   [4.0, 4.0]    # x, y extent of the traversable plate (m)
+
+keepout:
+  resolution: 0.05      # OccupancyGrid cell size (m); match costmap resolution
+  margin: 1.0           # width of the lethal border drawn around the plate (m)
+  edge_standoff: 0.0    # extra inset of the FREE region from the physical edge
+                        # (m). 0 -> rely on costmap inflation_radius for standoff.
+  publish_period: 0.0   # 0 -> publish once, latched (transient_local). >0 -> Hz period.
+
+robot:
+  # Spawn inside the plate. RViz-only mode uses this only for odom origin;
+  # Gazebo mode spawns the robot here.
+  spawn: [0.0, 0.0, 0.2]

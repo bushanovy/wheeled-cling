@@ -1,0 +1,68 @@
+# =============================================================================
+# climb_course.yaml — ground -> slide -> flat wall course (single source of truth).
+#
+# Same role as climb_scene.yaml, but the robot starts ON THE GROUND, drives up a
+# transition ramp ("slide"), and continues onto the vertical wall. A robot can't
+# climb straight from the floor onto a 90 deg wall, so the ramp eases the corner.
+#
+# Geometry is generated into BOTH the Gazebo world and the C++ adhesion plugin and
+# the RViz markers from these numbers, so everything stays in the same place.
+# =============================================================================
+
+world_name: climb_course
+
+ground:
+  z: 0.0
+  mu: 1.0
+
+# ---------------------------------------------------------------------------
+# Transition ramp. Its top surface runs from the ground near (start_x, start_z)
+# up at `angle_deg` to meet the wall face.
+#
+# TUNE ONE NUMBER: angle_deg.
+#   * The ramp makes TWO concave corners: ground->slide and slide->wall.
+#   * 45 deg makes both corners equally gentle (135 deg each) -> easiest symmetric.
+#   * Smaller angle = gentler FLOOR entry but a sharper slide->wall corner.
+# Start gentle (30 deg) for an easy ground entry; raise toward 45 if the robot
+# struggles at the top (slide->wall) corner.
+# ---------------------------------------------------------------------------
+slide:
+  angle_deg: 30.0
+  start_x: -0.15
+  start_z: 0.0
+  width: 1.2
+  thickness: 0.04
+  length_margin: 0.12
+  mu: 1.0
+
+flat_wall:
+  pose: [1.0, 0.0, 1.5]
+  size: [0.10, 3.0, 3.0]
+  climb_face: "-x"
+  mu: 1.0
+
+robot:
+  name: robot_3d3s
+  wheel_radius: 0.05
+  circumradius: 0.41405
+  mass: 8.715
+  start_on: ground          # ground | wall
+  ground_start_x: -1.2      # spawn here on the floor, facing +X toward the ramp
+  ground_clearance_m: 0.0
+
+adhesion:
+  model: gap_decay
+  force_n: 900.0
+  min_force_n: 0.0
+  min_wall_force_n: 350.0
+  gap_reference_mm: 3.0
+  gap_bias_mm: 0.0
+  max_gap_m: 0.06
+  full_contact_depth_m: 0.002
+  min_contact_fraction: 0.10
+  tilt_floor: 0.45
+  tilt_recovery_90: 0.55
+  # all three surfaces active for the full course:
+  enable_ground: true
+  enable_slide: true
+  enable_opposite_wall: false

@@ -1,0 +1,49 @@
+# =============================================================================
+# wall_nav.yaml - SINGLE SOURCE OF TRUTH for Stage-2 vertical-wall motion
+# planning and its EDGES.
+#
+# The robot climbs a finite 3 m x 3 m steel wall (from climb_scene.yaml). Because
+# odom_node.py integrates BODY-frame velocity into a planar (x, y, yaw) pose, the
+# `odom` frame IS the wall-tangent plane while climbing:
+#     odom +x  = "forward" = UP the wall   (world +Z)
+#     odom +y  = lateral                   (world +Y)
+# So the wall face is just a keepout rectangle in odom, centered on the spawn
+# point. Same surface_keepout_publisher.py and StaticLayer as Stage 1.
+#
+# Frames/units: meters. Edit geometry here only.
+# =============================================================================
+
+frame_id: odom
+
+# --- Wall face in the WORLD frame (mirrors climb_scene.yaml flat_wall) ---
+wall:
+  face_x: 0.95              # climbed face plane: pose.x(1.0) - size.x/2(0.05)
+  normal: [-1.0, 0.0, 0.0]  # outward from the climbed face
+  center_world: [0.95, 0.0, 1.5]
+  height: 3.0               # world Z extent of the face
+  width: 3.0                # world Y extent of the face
+
+# --- Spawn point on the wall (base_footprint), = odom origin ---
+spawn:
+  world: [0.95, 0.0, 1.5]   # face_x, y_center, start_height_z
+
+# --- Derived odom-frame keepout (surface-tangent) ---
+#   center = (world_z - spawn_z, world_y - spawn_y) at the wall center = (0, 0)
+#   size   = [height, width]
+# Wall spans odom_x in [-1.5, 1.5] (bottom..top) and odom_y in [-1.5, 1.5].
+surface:
+  center: [0.0, 0.0]
+  size:   [3.0, 3.0]
+
+keepout:
+  resolution: 0.05
+  margin: 1.0
+  edge_standoff: 0.0
+  publish_period: 0.0
+
+# --- wall_plane: where to PLACE the odom frame in the world for RViz, so the
+#     keepout/path/robot render on the actual wall. Rotation Ry(-90 deg) maps
+#     odom +x -> world +Z (up) and odom +y -> world +Y (lateral). ---
+wall_plane:
+  xyz: [0.95, 0.0, 1.5]
+  rpy: [0.0, -1.5707963, 0.0]
