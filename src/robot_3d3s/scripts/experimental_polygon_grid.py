@@ -353,26 +353,21 @@ class ExperimentalPolygonGrid(Node):
     def _publish(self):
         stamp = self.get_clock().now().to_msg()
         markers = MarkerArray()
-        pick_points = []
-        axial_lines = max(3, int(self.get_parameter('axial_lines').value))
-        rings = max(2, int(self.get_parameter('rings').value))
-        ring_segments = max(8, int(self.get_parameter('ring_segments').value))
-        line_width = max(0.001, float(self.get_parameter('line_width_m').value))
         surface_alpha = _clamp(
             float(self.get_parameter('surface_alpha').value), 0.0, 1.0)
         surface_axis_segments = max(
             1, int(self.get_parameter('surface_axis_segments').value))
         surface_ring_segments = max(
             8, int(self.get_parameter('surface_ring_segments').value))
-        point_cloud_axis_samples = max(
-            2, int(self.get_parameter('point_cloud_axis_samples').value))
-        point_cloud_ring_samples = max(
-            8, int(self.get_parameter('point_cloud_ring_samples').value))
         hit_target_enabled = bool(
             self.get_parameter('hit_target_enabled').value)
         hit_target_alpha = _clamp(
             float(self.get_parameter('hit_target_alpha').value), 0.0, 1.0)
         surfaces = list(self._surfaces())
+        # Only the solid OGRE hit-target cylinder is published now. The
+        # dense yellow wireframe + PointCloud2 dots have been removed per
+        # user request; the planner still publishes its own thinner gray
+        # surface grid in the surface_goal_surface namespace.
         for marker_id, (axis, axis_point, radius, length) in enumerate(
                 surfaces, start=1):
             if hit_target_enabled:
@@ -386,17 +381,12 @@ class ExperimentalPolygonGrid(Node):
                     axis, axis_point, radius, length,
                     (0.55, 0.62, 0.66, surface_alpha),
                     surface_axis_segments, surface_ring_segments))
-            markers.markers.append(_grid_marker(
-                stamp, self.frame, self.namespace, marker_id, axis,
-                axis_point, radius, length, (0.85, 0.85, 0.20, 0.55),
-                axial_lines, rings, ring_segments, line_width))
-            if self.point_pub is not None:
-                pick_points.extend(_surface_points(
-                    axis, axis_point, radius, length,
-                    point_cloud_axis_samples, point_cloud_ring_samples))
         self.pub.publish(markers)
+        # PointCloud2 publish intentionally skipped: the planner's own
+        # surface grid is sufficient and the dense point cloud made the
+        # view too noisy.
         if self.point_pub is not None:
-            self.point_pub.publish(_point_cloud(stamp, self.frame, pick_points))
+            self.point_pub.publish(_point_cloud(stamp, self.frame, []))
 
 
 def main(args=None):

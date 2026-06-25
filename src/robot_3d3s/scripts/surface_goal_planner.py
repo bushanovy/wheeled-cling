@@ -302,7 +302,9 @@ class SurfaceGoalPlanner(Node):
             self._rebuild_default_goal()
 
         self.create_timer(1.0 / self.publish_hz, self._tick)
-        self.create_timer(0.5, self._publish_markers)
+        # Publish markers at 10 Hz so the green route line shortens in
+        # real time as the robot moves along it.
+        self.create_timer(0.1, self._publish_markers)
 
         self.get_logger().info(
             f'surface_goal_planner ready: graph surfaces='
@@ -1537,6 +1539,38 @@ class SurfaceGoalPlanner(Node):
 
     def _route_marker(self, stamp):
         if self.route_points:
+            # The route marker starts at the robot's current projected
+            # position so the green line visibly shortens as the robot
+            # advances along the path.  ``self.route_index`` is the next
+            # waypoint the robot is approaching; we look from there
+            # forward to the goal.
+            pos = self._robot_position()
+            start_idx = self.route_index
+            start_point = None
+            if pos is not None:
+                current_projection = self.surface_graph.closest_projection(
+                    pos)
+                if current_projection is not None:
+                    # Snap start_idx to the closest route point that
+                    # the robot is currently on / has just passed.
+                    min_dist = float('inf')
+                    for i in range(self.route_index,
+                                   len(self.route_points)):
+                        rp = self.route_points[i]
+                        try:
+                            d = rp.surface.distance_between(
+                                (current_projection.u, current_projection.v),
+                                (rp.u, rp.v))
+                        except Exception:
+                            continue
+                        if d < min_dist:
+                            min_dist = d
+                            start_idx = i
+                    start_point = current_projection.point
+            if start_point is None:
+                # No TF available yet: fall back to the route waypoint.
+                start_point = self.route_points[start_idx].point
+
             marker = Marker()
             marker.header.frame_id = self.world_frame
             marker.header.stamp = stamp
@@ -1550,7 +1584,12 @@ class SurfaceGoalPlanner(Node):
             marker.color.g = 1.0
             marker.color.b = 0.35
             marker.color.a = 0.95
-            for route_point in self.route_points:
+            marker.points.append(Point(
+                x=start_point[0], y=start_point[1], z=start_point[2]))
+            # Append every remaining waypoint strictly after the
+            # current one.  When ``start_idx`` advances, the line gets
+            # visibly shorter.
+            for route_point in self.route_points[start_idx + 1:]:
                 x, y, z = route_point.point
                 marker.points.append(Point(x=x, y=y, z=z))
             return marker
