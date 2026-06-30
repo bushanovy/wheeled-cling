@@ -77,7 +77,7 @@ class AdhesionSceneRviz(Node):
         marker.color.r = 0.24
         marker.color.g = 0.24
         marker.color.b = 0.82
-        marker.color.a = 0.55
+        marker.color.a = 1.0
         return marker
 
     def _publish(self):

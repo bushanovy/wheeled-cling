@@ -48,7 +48,7 @@ def generate_launch_description():
     plugins_path = os.path.abspath(os.path.join(pkg, '..', '..', 'lib'))
     controllers_yaml = os.path.join(pkg, 'config', 'swerve_controller.yaml')
     default_force_table = os.path.join(pkg, 'config', 'kmw100_comsol_seed_table.csv')
-    default_rviz_config = os.path.join(pkg, 'config', 'display.rviz')
+    default_rviz_config = os.path.join(pkg, 'config', 'horizontal_pipe.rviz')
     defaults = DEFAULTS
 
     existing_gz_path = os.environ.get('GZ_SIM_RESOURCE_PATH', '')
@@ -424,17 +424,19 @@ def generate_launch_description():
             'grid_profile': 'configured_pipe',
             'grid_namespace': 'pipe_surface_grid',
             'publish_hz': 5.0,
-            'axial_lines': 16,
-            'rings': 24,
-            'ring_segments': 72,
-            'line_width_m': 0.010,
+            # Higher grid density plus an opaque solid CYLINDER hit target
+            # make RViz Publish Point reliable while keeping the pipe visible.
+            'axial_lines': 48,
+            'rings': 64,
+            'ring_segments': 192,
+            'line_width_m': 0.014,
             'hit_target_enabled': True,
-            'hit_target_alpha': 0.08,
+            'hit_target_alpha': 1.0,
             'surface_alpha': 0.0,
-            'surface_axis_segments': 24,
-            'surface_ring_segments': 72,
-            'point_cloud_axis_samples': 56,
-            'point_cloud_ring_samples': 112,
+            'surface_axis_segments': 96,
+            'surface_ring_segments': 224,
+            'point_cloud_axis_samples': 112,
+            'point_cloud_ring_samples': 224,
             'cylinder_axis': 'x',
             'axis_x': ParameterValue(pipe_center_x, value_type=float),
             'axis_y': ParameterValue(pipe_center_y, value_type=float),

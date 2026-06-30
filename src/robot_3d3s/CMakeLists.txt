@@ -53,6 +53,7 @@ install(PROGRAMS
   scripts/wheel_tf_debug.py
   scripts/surface_geometry.py
   scripts/mockup_climb_planner.py
+  scripts/bayesian_motion_model.py
   scripts/surface_goal_planner.py
   scripts/horizontal_pipe_planner.py
   scripts/adhesion_scene_rviz.py

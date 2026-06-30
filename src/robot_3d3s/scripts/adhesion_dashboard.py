@@ -44,6 +44,7 @@ from PyQt5.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QTableWidget,
@@ -145,6 +146,29 @@ PLOT_SPECS = {
     'boundary_risk': ('Boundary risk', QColor(225, 120, 0)),
     'torque_est_total_nm': ('Holding torque Nm', QColor(45, 45, 45)),
     'cmd_speed_mps': ('Cmd speed m/s', QColor(130, 130, 130)),
+    'bayesian_posterior': ('Bayesian P(safe)', QColor(110, 90, 200)),
+    'bayesian_speed_scale': ('Bayesian speed scale', QColor(70, 160, 220)),
+}
+
+#: Per-feature log-likelihoods from the Bayesian model.  All
+#: contributions are log-ratios ``log P(safe|x_i) - log P(unsafe|x_i)``
+#: so positive values mean "this feature is more consistent with
+#: safe than with unsafe".  These come straight from the planner's
+#: ``/surface_goal_planner/debug`` topic.
+BAYESIAN_FEATURE_KEYS = (
+    'force_margin',
+    'contact_fraction',
+    'safety_pressure',
+    'edge_clearance_norm',
+    'level_pressure',
+)
+
+BAYESIAN_FEATURE_LABELS = {
+    'force_margin': 'Force margin',
+    'contact_fraction': 'Contact',
+    'safety_pressure': 'Safety pressure',
+    'edge_clearance_norm': 'Edge clearance',
+    'level_pressure': 'Level pressure',
 }
 
 
@@ -263,6 +287,16 @@ class DashboardNode(Node):
         self.create_subscription(
             TFMessage, '/world/adhesion_model_test/dynamic_pose/info',
             self._world_pose_cb, 10)
+        # Service client to ask the planner to rebuild its Bayesian
+        # smooth motion model from the current ``bayesian_*``
+        # parameters.  Lets the operator retune the model live from
+        # this dashboard and apply the changes without restarting
+        # the planner node.
+        from std_srvs.srv import Trigger
+        self._bayesian_reload_client = self.create_client(
+            Trigger, '/surface_goal_planner/reload_bayesian_model')
+        self._bayesian_reload_pending = False
+        self._bayesian_reload_result_text = ''
         self.direct_cmd_pub = self.create_publisher(
             TwistStamped, '/swerve_controller/cmd_vel', 10)
         self.climb_cmd_pub = self.create_publisher(
@@ -327,8 +361,23 @@ class DashboardNode(Node):
             data = json.loads(msg.data)
         except (TypeError, ValueError, json.JSONDecodeError):
             return
+        t = self._now()
+        posterior = data.get('bayesian_posterior')
+        scale = data.get('bayesian_speed_scale')
         with self.lock:
             self.latest_planner_debug = data
+            if posterior is not None:
+                try:
+                    self.series['bayesian_posterior'].append(
+                        (t, float(posterior)))
+                except (TypeError, ValueError):
+                    pass
+            if scale is not None:
+                try:
+                    self.series['bayesian_speed_scale'].append(
+                        (t, float(scale)))
+                except (TypeError, ValueError):
+                    pass
 
     def _joint_cb(self, msg):
         with self.lock:
@@ -413,6 +462,73 @@ class DashboardNode(Node):
                 'stamp': self._now(),
                 'cmd': (vx, vy, omega),
             }
+
+    def call_bayesian_reload(self, on_done=None, on_error=None):
+        """Ask the planner to rebuild its Bayesian model.
+
+        ``on_done(success: bool, message: str)`` is invoked from a
+        ROS callback thread once the service responds.  ``on_error``
+        is invoked if the call cannot be made (e.g. service not up
+        or planner is not running).
+        """
+        from std_srvs.srv import Trigger
+
+        def _log_fail(detail):
+            with self.lock:
+                self._bayesian_reload_pending = False
+                self._bayesian_reload_result_text = (
+                    f'reload failed: {detail}')
+            if on_error is not None:
+                on_error(detail)
+
+        if self._bayesian_reload_client is None:
+            _log_fail('no reload client available')
+            return False
+        if self._bayesian_reload_pending:
+            _log_fail('reload already in progress')
+            return False
+        if not self._bayesian_reload_client.service_is_ready():
+            _log_fail(
+                'service /surface_goal_planner/reload_bayesian_model is not up '
+                '(planner may be restarting or not launched yet)')
+            return False
+        with self.lock:
+            self._bayesian_reload_pending = True
+            self._bayesian_reload_result_text = 'reloading...'
+
+        def _on_response(future):
+            try:
+                response = future.result()
+            except Exception as exc:  # noqa: BLE001
+                with self.lock:
+                    self._bayesian_reload_pending = False
+                    self._bayesian_reload_result_text = (
+                        f'reload exception: {exc}')
+                if on_error is not None:
+                    on_error(str(exc))
+                return
+            ok = bool(getattr(response, 'success', False))
+            message = str(getattr(response, 'message', ''))
+            with self.lock:
+                self._bayesian_reload_pending = False
+                self._bayesian_reload_result_text = (
+                    f'reload ok: {message}' if ok else
+                    f'reload failed: {message}')
+            if on_done is not None:
+                on_done(ok, message)
+
+        request = Trigger.Request()
+        future = self._bayesian_reload_client.call_async(request)
+        future.add_done_callback(_on_response)
+        return True
+
+    def bayesian_reload_status(self):
+        """Return ``(pending, text)`` for the last reload attempt."""
+        with self.lock:
+            return (
+                bool(self._bayesian_reload_pending),
+                str(self._bayesian_reload_result_text),
+            )
 
 
 class PlotWidget(QFrame):
@@ -680,7 +796,167 @@ class DashboardWindow(QWidget):
             check_layout.addWidget(box, idx // 4, idx % 4)
         check_group.setLayout(check_layout)
         layout.addWidget(check_group)
+        layout.addWidget(self._bayesian_panel())
         return layout
+
+    def _bayesian_panel(self):
+        """A live readout of the Bayesian smooth motion model.
+
+        The panel is fed from the ``bayesian_*`` fields that the planner
+        publishes on ``/surface_goal_planner/debug``.  It exposes:
+
+        * a large ``P(safe)`` number plus a green-to-red probability bar;
+        * the current speed scale and a matching scaled bar;
+        * colour-coded ``hold`` and ``emergency_hold`` flags;
+        * a small log-likelihood-per-feature table so the operator can see
+          which feature is driving the current belief.
+        """
+        group = QGroupBox('Bayesian smooth motion model')
+        outer = QVBoxLayout()
+
+        # Top row: two probability / scale bars side by side.
+        top = QHBoxLayout()
+        post_box = QVBoxLayout()
+        post_title = QHBoxLayout()
+        post_title.addWidget(QLabel('P(safe | observation)'))
+        self.bayes_posterior_text = QLabel('n/a')
+        f = self.bayes_posterior_text.font()
+        f.setBold(True)
+        f.setPointSizeF(f.pointSizeF() * 1.4)
+        self.bayes_posterior_text.setFont(f)
+        post_title.addWidget(self.bayes_posterior_text)
+        post_title.addStretch(1)
+        post_box.addLayout(post_title)
+        self.bayes_posterior_bar = QProgressBar()
+        self.bayes_posterior_bar.setRange(0, 1000)
+        self.bayes_posterior_bar.setTextVisible(False)
+        self.bayes_posterior_bar.setFixedHeight(16)
+        post_box.addWidget(self.bayes_posterior_bar)
+        top.addLayout(post_box, 2)
+
+        scale_box = QVBoxLayout()
+        scale_title = QHBoxLayout()
+        scale_title.addWidget(QLabel('Speed scale'))
+        self.bayes_scale_text = QLabel('n/a')
+        f = self.bayes_scale_text.font()
+        f.setBold(True)
+        f.setPointSizeF(f.pointSizeF() * 1.2)
+        self.bayes_scale_text.setFont(f)
+        scale_title.addWidget(self.bayes_scale_text)
+        scale_title.addStretch(1)
+        scale_box.addLayout(scale_title)
+        self.bayes_scale_bar = QProgressBar()
+        self.bayes_scale_bar.setRange(0, 1000)
+        self.bayes_scale_bar.setTextVisible(False)
+        self.bayes_scale_bar.setFixedHeight(16)
+        scale_box.addWidget(self.bayes_scale_bar)
+        top.addLayout(scale_box, 2)
+
+        outer.addLayout(top)
+
+        # Middle row: status flags.
+        flag_row = QHBoxLayout()
+        self.bayes_enabled_label = QLabel('enabled: n/a')
+        flag_row.addWidget(self.bayes_enabled_label)
+        self.bayes_hold_label = QLabel('hold: n/a')
+        self.bayes_hold_label.setStyleSheet(
+            'QLabel { padding: 2px 6px; border-radius: 6px; }')
+        flag_row.addWidget(self.bayes_hold_label)
+        self.bayes_emergency_label = QLabel('emergency: n/a')
+        self.bayes_emergency_label.setStyleSheet(
+            'QLabel { padding: 2px 6px; border-radius: 6px; }')
+        flag_row.addWidget(self.bayes_emergency_label)
+        flag_row.addStretch(1)
+        outer.addLayout(flag_row)
+
+        # Per-feature log-likelihood table.  Values are log-ratios;
+        # positive = more "safe", negative = more "unsafe".
+        feat_grid = QGridLayout()
+        feat_grid.addWidget(QLabel('Feature'), 0, 0)
+        feat_grid.addWidget(QLabel('log P(safe)/P(unsafe)'), 0, 1)
+        feat_grid.addWidget(QLabel(''), 0, 2)
+        self.bayes_feature_bars = {}
+        for row, key in enumerate(BAYESIAN_FEATURE_KEYS, start=1):
+            label = QLabel(BAYESIAN_FEATURE_LABELS[key])
+            feat_grid.addWidget(label, row, 0)
+            value_label = QLabel('n/a')
+            value_label.setMinimumWidth(70)
+            value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            f = value_label.font()
+            f.setBold(True)
+            value_label.setFont(f)
+            feat_grid.addWidget(value_label, row, 1)
+            bar = QProgressBar()
+            # Use 0..1000 as the display range; we will map log-ratios
+            # in [-3, +3] to [0, 1000] below.
+            bar.setRange(0, 1000)
+            bar.setValue(500)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(12)
+            feat_grid.addWidget(bar, row, 2)
+            self.bayes_feature_bars[key] = (value_label, bar)
+        outer.addLayout(feat_grid)
+
+        # Hint line so the operator knows where the data comes from.
+        hint = QLabel(
+            'Source: /surface_goal_planner/debug '
+            '(bayesian_posterior / bayesian_speed_scale / bayesian_feature_log_likelihoods)')
+        f = hint.font()
+        f.setPointSizeF(f.pointSizeF() * 0.85)
+        hint.setFont(f)
+        hint.setStyleSheet('color: #666;')
+        outer.addWidget(hint)
+
+        # Bottom row: ``Reload Bayesian model`` button + status.  The
+        # button calls the planner's ``~/reload_bayesian_model``
+        # Trigger service so the operator can re-tune the model from
+        # a terminal (``ros2 param set ...``) and apply the changes
+        # without restarting the planner.
+        action_row = QHBoxLayout()
+        self.bayes_reload_btn = QPushButton('Reload Bayesian model')
+        self.bayes_reload_btn.setToolTip(
+            'Ask /surface_goal_planner to rebuild its Bayesian model '
+            'from the current bayesian_* ROS parameters.  Use after '
+            '"ros2 param set /surface_goal_planner bayesian_...".')
+        self.bayes_reload_btn.clicked.connect(self._reload_bayesian_model)
+        action_row.addWidget(self.bayes_reload_btn)
+        self.bayes_reload_status = QLabel('idle')
+        self.bayes_reload_status.setStyleSheet('color: #666;')
+        action_row.addWidget(self.bayes_reload_status, 1)
+        outer.addLayout(action_row)
+
+        group.setLayout(outer)
+        return group
+
+    def _reload_bayesian_model(self):
+        """Ask the planner to rebuild its Bayesian model now."""
+        self.bayes_reload_btn.setEnabled(False)
+        self.bayes_reload_status.setText('reloading...')
+
+        def _on_done(success, message):
+            self.bayes_reload_btn.setEnabled(True)
+            if success:
+                self.bayes_reload_status.setStyleSheet(
+                    'color: #166534; font-weight: bold;')
+                self.bayes_reload_status.setText(f'ok: {message}')
+            else:
+                self.bayes_reload_status.setStyleSheet(
+                    'color: #92400e; font-weight: bold;')
+                self.bayes_reload_status.setText(f'failed: {message}')
+
+        def _on_error(detail):
+            self.bayes_reload_btn.setEnabled(True)
+            self.bayes_reload_status.setStyleSheet(
+                'color: #92400e; font-weight: bold;')
+            self.bayes_reload_status.setText(f'error: {detail}')
+
+        if not self.node.call_bayesian_reload(
+                on_done=_on_done, on_error=_on_error):
+            self.bayes_reload_btn.setEnabled(True)
+            self.bayes_reload_status.setStyleSheet(
+                'color: #92400e; font-weight: bold;')
+            self.bayes_reload_status.setText(
+                'service not up; launch the planner first')
 
     def _feedback_panel(self):
         layout = QVBoxLayout()
@@ -1117,7 +1393,99 @@ class DashboardWindow(QWidget):
         enabled = [key for key, box in self.checkboxes.items() if box.isChecked()]
         self.plot.set_data(snap['series'], enabled)
         self._refresh_summary(snap)
+        self._refresh_bayesian_panel(snap)
         self._refresh_table(snap)
+
+    @staticmethod
+    def _bayes_log_ratio_to_bar(value):
+        """Map a log P(safe)/P(unsafe) ratio to the 0..1000 bar range.
+
+        The ratio typically lives in [-3, +3] (each unit being roughly
+        one ``e`` of evidence).  We clamp to that range and centre the
+        bar at 500 so positive values fill to the right and negative
+        values to the left.
+        """
+        clamped = max(-3.0, min(3.0, float(value)))
+        return int(500.0 + 500.0 * clamped / 3.0)
+
+    def _refresh_bayesian_panel(self, snap):
+        """Pull the planner's ``bayesian_*`` fields and update the panel.
+
+        The panel tolerates a missing planner (the launch may not be
+        running yet) and a planner that does not publish the new
+        Bayesian fields yet (older versions of the planner).
+        """
+        planner = snap.get('planner_debug', {}) or {}
+        has_bayes = 'bayesian_posterior' in planner
+        if not has_bayes:
+            self.bayes_posterior_text.setText('n/a')
+            self.bayes_posterior_bar.setValue(500)
+            self.bayes_scale_text.setText('n/a')
+            self.bayes_scale_bar.setValue(500)
+            self.bayes_enabled_label.setText('enabled: n/a')
+            self.bayes_hold_label.setText('hold: n/a')
+            self.bayes_hold_label.setStyleSheet(
+                'QLabel { padding: 2px 6px; border-radius: 6px; '
+                'background: #eee; color: #666; }')
+            self.bayes_emergency_label.setText('emergency: n/a')
+            self.bayes_emergency_label.setStyleSheet(
+                'QLabel { padding: 2px 6px; border-radius: 6px; '
+                'background: #eee; color: #666; }')
+            for value_label, bar in self.bayes_feature_bars.values():
+                value_label.setText('n/a')
+                bar.setValue(500)
+            return
+
+        try:
+            posterior = float(planner.get('bayesian_posterior', 0.0))
+        except (TypeError, ValueError):
+            posterior = 0.0
+        try:
+            scale = float(planner.get('bayesian_speed_scale', 0.0))
+        except (TypeError, ValueError):
+            scale = 0.0
+        self.bayes_posterior_text.setText(f'{posterior:.3f}')
+        self.bayes_posterior_bar.setValue(int(round(posterior * 1000.0)))
+        self.bayes_scale_text.setText(f'{scale * 100.0:5.1f}%')
+        self.bayes_scale_bar.setValue(int(round(scale * 1000.0)))
+
+        enabled = planner.get('bayesian_speed_enabled', None)
+        if enabled is None:
+            self.bayes_enabled_label.setText('enabled: n/a')
+        else:
+            self.bayes_enabled_label.setText(
+                f'enabled: {"yes" if bool(enabled) else "no"}')
+        hold = bool(planner.get('bayesian_hold', False))
+        self.bayes_hold_label.setText('hold: YES' if hold else 'hold: no')
+        self.bayes_hold_label.setStyleSheet(
+            'QLabel { padding: 2px 6px; border-radius: 6px; '
+            'background: #fde68a; color: #92400e; font-weight: bold; }'
+            if hold else
+            'QLabel { padding: 2px 6px; border-radius: 6px; '
+            'background: #e5e7eb; color: #374151; }')
+        emergency = bool(planner.get('bayesian_emergency_hold', False))
+        self.bayes_emergency_label.setText(
+            'emergency: YES' if emergency else 'emergency: no')
+        self.bayes_emergency_label.setStyleSheet(
+            'QLabel { padding: 2px 6px; border-radius: 6px; '
+            'background: #fecaca; color: #991b1b; font-weight: bold; }'
+            if emergency else
+            'QLabel { padding: 2px 6px; border-radius: 6px; '
+            'background: #e5e7eb; color: #374151; }')
+
+        feature_contribs = planner.get('bayesian_feature_log_likelihoods',
+                                       {}) or {}
+        for key, (value_label, bar) in self.bayes_feature_bars.items():
+            if key in feature_contribs:
+                try:
+                    ratio = float(feature_contribs[key])
+                except (TypeError, ValueError):
+                    ratio = 0.0
+                value_label.setText(f'{ratio:+.2f}')
+                bar.setValue(self._bayes_log_ratio_to_bar(ratio))
+            else:
+                value_label.setText('n/a')
+                bar.setValue(500)
 
     def _refresh_summary(self, snap):
         status = snap['status']

@@ -44,6 +44,13 @@ Visualization Manager:
     - Class: rviz_default_plugins/MarkerArray
       Name: MarkerArray
       Enabled: true
+      Namespaces:
+        climb_route: true
+        flat_wall: true
+        ground: true
+        slide: true
+        wall_goal: true
+        wall_normal: true
       Topic:
         Value: /climb_scene_markers
         Depth: 5

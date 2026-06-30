@@ -72,7 +72,7 @@ class ExperimentalPolygonRviz(Node):
         marker.color.r = 0.34
         marker.color.g = 0.025
         marker.color.b = 0.030
-        marker.color.a = 0.82
+        marker.color.a = 1.0
         marker.text = name
         return marker
 

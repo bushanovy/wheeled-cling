@@ -111,6 +111,53 @@ ros2 service list   # many planner services available
   applying KMW100 magnetic holding force per wheel.
 - `src/robot_3d3s/scripts/surface_geometry.py` — CylinderSurface,
   PolygonSurface, SurfaceGraph and the A* routing logic.
+- `src/robot_3d3s/scripts/bayesian_motion_model.py` —
+  Gaussian naive Bayes speed scaler that replaces the hard
+  `boundary_hold` and piecewise `edge_motion_scale` with a
+  single C^0-continuous speed curve driven by
+  `P(safe | force_margin, contact, risk, edge, slope)`.  See
+  `docs/bayesian_motion_model.md` for the full derivation.  All
+  parameters (`bayesian_mean_safe_*`, `bayesian_sigma_unsafe_*`,
+  `bayesian_ramp_*`, `bayesian_min_scale`, ...) are exposed as
+  ROS parameters; a `Trigger` service at
+  `/surface_goal_planner/reload_bayesian_model` re-reads them
+  on the fly.
+
+### Smooth motion planning (Bayesian)
+
+The planner publishes a JSON debug message on
+`/surface_goal_planner/debug` that now includes the Bayesian
+model's state:
+
+```json
+{
+  "bayesian_posterior": 0.93,
+  "bayesian_speed_scale": 0.95,
+  "bayesian_hold": false,
+  "bayesian_emergency_hold": false,
+  "bayesian_feature_log_likelihoods": {
+    "force_margin": 1.0,
+    "contact_fraction": 0.5,
+    "safety_pressure": 0.0,
+    "edge_clearance_norm": 0.0,
+    "level_pressure": 0.0
+  }
+}
+```
+
+Watch `bayesian_posterior` to see the safety belief evolve in
+real time.  If the model starts oscillating between full speed and
+zero speed, increase `bayesian_posterior_tau_s` (default 0.20 s)
+to add more low-pass smoothing.
+
+### Denser pipe grid
+
+`experimental_polygon_grid.py` and the planner's own cylinder
+markers default to a much denser wireframe (32 axial lines, 48
+rings, 128 ring segments) so RViz Publish Point reliably hits the
+pipe surface.  The `horizontal_pipe_test.launch.py` overrides
+to an even higher density (48 axial lines, 64 rings, 192 ring
+segments) for the side-pipe test.
 
 ## Clean-up before next run
 

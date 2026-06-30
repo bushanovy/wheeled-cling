@@ -48,6 +48,10 @@ def _rgba(r, g, b, a):
     return c
 
 
+def _clamp(value, lower, upper):
+    return max(lower, min(upper, value))
+
+
 class ClimbSceneRviz(Node):
     def __init__(self):
         super().__init__('climb_scene_rviz')
@@ -191,6 +195,10 @@ class ClimbSceneRviz(Node):
             mid += 1
 
         if self.selected_point is not None:
+            route = self._route_marker(stamp, mid, wall, face_x, slide)
+            if route is not None:
+                markers.markers.append(route)
+                mid += 1
             markers.markers.append(self._sphere(
                 stamp, mid, 'wall_goal', self.selected_point,
                 _rgba(0.1, 1.0, 0.3, 1.0)))
@@ -279,6 +287,58 @@ class ClimbSceneRviz(Node):
         m.points = [Point(x=p0[0], y=p0[1], z=p0[2]),
                     Point(x=p1[0], y=p1[1], z=p1[2])]
         m.color = color
+        return m
+
+    def _route_marker(self, stamp, mid, wall, face_x, slide):
+        if self.selected_point is None or not isinstance(wall, dict):
+            return None
+
+        pose = [float(v) for v in wall.get('pose', [1.0, 0.0, 1.5])]
+        size = [float(v) for v in wall.get('size', [0.10, 3.0, 3.0])]
+        if face_x is None:
+            face_x, _ = self._wall_face(wall, pose, size)
+        target_y = _clamp(
+            self.selected_point[1],
+            pose[1] - 0.5 * size[1],
+            pose[1] + 0.5 * size[1])
+        target_z = _clamp(
+            self.selected_point[2],
+            pose[2] - 0.5 * size[2],
+            pose[2] + 0.5 * size[2])
+
+        points = []
+        ground = self.scene.get('ground') if isinstance(self.scene, dict) else {}
+        ground_z = float(ground.get('z', 0.0)) if isinstance(ground, dict) else 0.0
+        if isinstance(slide, dict):
+            theta = math.radians(float(slide.get('angle_deg', 45.0)))
+            sx = float(slide.get('start_x', -0.15))
+            sz = float(slide.get('start_z', ground_z))
+            end_x = float(slide.get('wall_x', face_x))
+            top_z = sz + (end_x - sx) * math.tan(theta)
+            points.extend((
+                (sx, pose[1], ground_z + 0.03),
+                (end_x, pose[1], top_z + 0.03),
+            ))
+        else:
+            robot = self.scene.get('robot') if isinstance(self.scene, dict) else {}
+            start_z = (
+                float(robot.get('start_height_z', pose[2]))
+                if isinstance(robot, dict) else pose[2])
+            points.append((face_x, pose[1], start_z))
+
+        points.append((face_x, target_y, target_z))
+        m = Marker()
+        m.header.frame_id = self.world_frame
+        m.header.stamp = stamp
+        m.ns = 'climb_route'
+        m.id = mid
+        m.type = Marker.LINE_STRIP
+        m.action = Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.x = 0.035
+        m.color = _rgba(0.1, 0.85, 1.0, 0.95)
+        for x, y, z in points:
+            m.points.append(Point(x=x, y=y, z=z))
         return m
 
 

@@ -13,8 +13,8 @@ Three pipes are visualised:
   * horizontal_pipe:     x-axis, R 0.2540 m, length 3.1312 m
 
 Each pipe gets:
-  * a SOLID OGRE cylinder hit-target (alpha 0.06) so RViz Publish Point
-    has a reliable, opaque 3D surface to ray-cast against.  This is the
+  * a SOLID OGRE cylinder hit-target (alpha 1.0 by default) so RViz Publish
+    Point has a reliable, visible 3D surface to ray-cast against.  This is the
     key fix: transparent TRIANGLE_LIST/POINT_CLOUD markers are not
     reliably hit by RViz Publish Point across versions; a built-in
     ``Marker.CYLINDER`` always registers in the OGRE scene query.
@@ -100,11 +100,9 @@ def _hit_target_marker(stamp, frame_id: str, namespace: str, marker_id: int,
                        length: float, color_rgba):
     """Solid OGRE cylinder marker that Publish Point can always hit.
 
-    The marker is rendered with a very low alpha (0.06 by default) so
-    it is almost invisible to the eye, but the underlying mesh is
-    fully written to the depth buffer and included in OGRE scene
-    queries.  This is the geometry that Publish Point ray-casts against
-    when the user clicks on the pipe surface.
+    This is the geometry that Publish Point ray-casts against when the user
+    clicks on the pipe surface, so it stays fully opaque and easy to see in
+    every configured map.
     """
     marker = Marker()
     marker.header.frame_id = frame_id
@@ -262,19 +260,24 @@ class ExperimentalPolygonGrid(Node):
                                '/experimental_polygon_markers')
         self.declare_parameter('point_cloud_topic', '')
         self.declare_parameter('hit_target_enabled', True)
-        self.declare_parameter('hit_target_alpha', 0.06)
+        self.declare_parameter('hit_target_alpha', 1.0)
         self.declare_parameter('grid_profile', 'experimental_polygon')
         self.declare_parameter('grid_namespace', '')
         self.declare_parameter('publish_hz', 1.0)
-        self.declare_parameter('axial_lines', 16)
-        self.declare_parameter('rings', 24)
-        self.declare_parameter('ring_segments', 72)
-        self.declare_parameter('line_width_m', 0.010)
+        # The default grid densities below are deliberately high so
+        # that RViz Publish Point reliably hits the pipe surface and
+        # operators get fine-grained visual feedback.  The
+        # ``horizontal_pipe_test.launch.py`` overrides these to even
+        # higher values.
+        self.declare_parameter('axial_lines', 32)
+        self.declare_parameter('rings', 48)
+        self.declare_parameter('ring_segments', 128)
+        self.declare_parameter('line_width_m', 0.008)
         self.declare_parameter('surface_alpha', 0.0)
-        self.declare_parameter('surface_axis_segments', 24)
-        self.declare_parameter('surface_ring_segments', 72)
-        self.declare_parameter('point_cloud_axis_samples', 48)
-        self.declare_parameter('point_cloud_ring_samples', 96)
+        self.declare_parameter('surface_axis_segments', 64)
+        self.declare_parameter('surface_ring_segments', 160)
+        self.declare_parameter('point_cloud_axis_samples', 80)
+        self.declare_parameter('point_cloud_ring_samples', 160)
         self.declare_parameter('cylinder_axis', 'x')
         self.declare_parameter('axis_x', 0.0)
         self.declare_parameter('axis_y', 0.0)
@@ -359,15 +362,25 @@ class ExperimentalPolygonGrid(Node):
             1, int(self.get_parameter('surface_axis_segments').value))
         surface_ring_segments = max(
             8, int(self.get_parameter('surface_ring_segments').value))
+        axial_lines = max(
+            1, int(self.get_parameter('axial_lines').value))
+        rings = max(
+            1, int(self.get_parameter('rings').value))
+        ring_segments = max(
+            8, int(self.get_parameter('ring_segments').value))
+        line_width = max(
+            0.001, float(self.get_parameter('line_width_m').value))
         hit_target_enabled = bool(
             self.get_parameter('hit_target_enabled').value)
         hit_target_alpha = _clamp(
             float(self.get_parameter('hit_target_alpha').value), 0.0, 1.0)
         surfaces = list(self._surfaces())
-        # Only the solid OGRE hit-target cylinder is published now. The
-        # dense yellow wireframe + PointCloud2 dots have been removed per
-        # user request; the planner still publishes its own thinner gray
-        # surface grid in the surface_goal_surface namespace.
+        # Publish three layers per surface so RViz Publish Point can
+        # always hit the pipe AND the operator gets a clearly visible
+        # grid on the pipe:
+        #   * 9000+: solid OGRE CYLINDER hit target (opaque by default)
+        #   * 1000+: filled TRIANGLE_LIST surface mesh (alpha = surface_alpha)
+        #   * 2000+: LINE_LIST wireframe (alpha 0.75, very visible)
         for marker_id, (axis, axis_point, radius, length) in enumerate(
                 surfaces, start=1):
             if hit_target_enabled:
@@ -379,14 +392,34 @@ class ExperimentalPolygonGrid(Node):
                 markers.markers.append(_surface_marker(
                     stamp, self.frame, self.namespace, 1000 + marker_id,
                     axis, axis_point, radius, length,
-                    (0.55, 0.62, 0.66, surface_alpha),
+                    (0.70, 0.70, 0.70, surface_alpha),
                     surface_axis_segments, surface_ring_segments))
+            # Always publish the wireframe so the operator can see the
+            # grid.  The line color matches the planner's active-surface
+            # cyan so it reads as part of the same surface overlay.
+            markers.markers.append(_grid_marker(
+                stamp, self.frame, self.namespace, 2000 + marker_id,
+                axis, axis_point, radius, length,
+                (0.62, 0.62, 0.62, 0.85),
+                axial_lines, rings, ring_segments, line_width))
         self.pub.publish(markers)
-        # PointCloud2 publish intentionally skipped: the planner's own
-        # surface grid is sufficient and the dense point cloud made the
-        # view too noisy.
+        # PointCloud2 publish is a dense hit-test fallback for RViz Publish
+        # Point.  The PointCloud2 display must have ``Selectable = true`` for
+        # this fallback to work.
         if self.point_pub is not None:
-            self.point_pub.publish(_point_cloud(stamp, self.frame, []))
+            pc_axis_samples = max(
+                2, int(self.get_parameter(
+                    'point_cloud_axis_samples').value))
+            pc_ring_samples = max(
+                8, int(self.get_parameter(
+                    'point_cloud_ring_samples').value))
+            pc_points = []
+            for (axis, axis_point, radius, length) in surfaces:
+                pc_points.extend(_surface_points(
+                    axis, axis_point, radius, length,
+                    pc_axis_samples, pc_ring_samples))
+            self.point_pub.publish(
+                _point_cloud(stamp, self.frame, pc_points))
 
 
 def main(args=None):

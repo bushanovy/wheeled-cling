@@ -32,6 +32,7 @@ from std_msgs.msg import Float64MultiArray, String
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
+from bayesian_motion_model import BayesianMotionModel, build_observation
 from surface_geometry import (
     CylinderSurface,
     PolygonSurface,
@@ -142,6 +143,45 @@ class SurfaceGoalPlanner(Node):
         self.declare_parameter('edge_margin_m', 0.10)
         self.declare_parameter('edge_slow_min_scale', 0.20)
 
+        # ---- Bayesian smooth motion model parameters --------------------
+        # The Bayesian model replaces the hard ``boundary_hold`` gate
+        # with a posterior probability of safety and a smooth speed
+        # scaler.  All keys are exposed as ROS parameters so a user
+        # can tune the model in place via ``ros2 param set`` and the
+        # ``~/reload_bayesian_model`` service.
+        self.declare_parameter('bayesian_speed_enabled', True)
+        self.declare_parameter('bayesian_replace_boundary_hold', True)
+        self.declare_parameter('bayesian_prior_safe', 0.7)
+        self.declare_parameter('bayesian_prior_unsafe', 0.3)
+        # Means per class per feature: bayesian_<mean|sigma>_<safe|unsafe>_<feature>
+        for prefix, vec in (
+            ('mean_safe',
+             (1.50, 0.90, 0.95, 0.90, 0.95)),
+            ('mean_unsafe',
+             (0.20, 0.10, 0.20, 0.10, 0.10)),
+            ('sigma_safe',
+             (0.50, 0.20, 0.20, 0.30, 0.25)),
+            ('sigma_unsafe',
+             (0.35, 0.25, 0.25, 0.25, 0.25)),
+        ):
+            for feature, value in zip(
+                    ('force_margin', 'contact_fraction',
+                     'safety_pressure', 'edge_clearance_norm',
+                     'level_pressure'),
+                    vec):
+                self.declare_parameter(
+                    f'bayesian_{prefix}_{feature}', float(value))
+        self.declare_parameter('bayesian_ramp_low', 0.30)
+        self.declare_parameter('bayesian_ramp_high', 0.85)
+        self.declare_parameter('bayesian_min_scale', 0.10)
+        self.declare_parameter('bayesian_hold_threshold', 0.50)
+        self.declare_parameter('bayesian_emergency_force_margin', 0.50)
+        self.declare_parameter('bayesian_emergency_contact_fraction', 0.05)
+        # Posterior low-pass time constant (s).  Larger values give a
+        # smoother speed scaler at the cost of additional lag.  Set
+        # to 0.0 to disable low-pass filtering.
+        self.declare_parameter('bayesian_posterior_tau_s', 0.20)
+
         # ---- Target / approach parameters --------------------------------
         self.declare_parameter('target_axis_m', -2.0)
         self.declare_parameter('target_angle_deg', 90.0)
@@ -229,6 +269,23 @@ class SurfaceGoalPlanner(Node):
         self.kp_theta = float(gp('kp_theta').value)
         self.angle_tol = math.radians(float(gp('angle_tolerance_deg').value))
         self.axis_tol = float(gp('axis_tolerance_m').value)
+
+        # ---- Bayesian smooth motion model --------------------------------
+        self.bayesian_speed_enabled = bool(
+            gp('bayesian_speed_enabled').value)
+        self.bayesian_replace_boundary_hold = bool(
+            gp('bayesian_replace_boundary_hold').value)
+        self.bayesian_posterior_tau_s = max(
+            0.0, float(gp('bayesian_posterior_tau_s').value))
+        self.bayesian_model: Optional[BayesianMotionModel] = None
+        self._last_bayesian_update_t = None
+        self.bayesian_posterior = 1.0
+        self.bayesian_speed_scale = 1.0
+        self.bayesian_hold = False
+        self.bayesian_emergency_hold = False
+        self.bayesian_feature_log_likelihoods: dict = {}
+        self.bayesian_log_likelihoods: dict = {}
+        self._reload_bayesian_model()
 
         # ---- State -------------------------------------------------------
         self.active_surface_name = 'configured_surface'
@@ -370,6 +427,11 @@ class SurfaceGoalPlanner(Node):
         self.declare_parameter('goal_z', 0.0)
         self.create_service(Trigger, '~/set_goal_from_params',
                             self._set_goal_from_params_srv_cb)
+        # Trigger variant: rebuild the Bayesian smooth motion model from
+        # the current ``bayesian_*`` ROS parameters.  Useful after a
+        # batch of ``ros2 param set`` calls.
+        self.create_service(Trigger, '~/reload_bayesian_model',
+                            self._reload_bayesian_model_srv_cb)
 
     def _reload_trigger_cb(self, request, response):
         ok = self._reload_surface_graph(reason='service call')
@@ -464,6 +526,139 @@ class SurfaceGoalPlanner(Node):
             },
         )
 
+    # ------------------------------------------------------------------
+    # Bayesian smooth motion model
+    # ------------------------------------------------------------------
+    def _bayesian_parameter_mapping(self):
+        """Return the current ``bayesian_*`` ROS parameters as a flat dict.
+
+        The dict uses the keys the ``BayesianMotionModel.from_mapping``
+        constructor expects.  Values are filtered through ``get_parameter``
+        so missing keys yield the model's defaults instead of raising.
+        """
+        gp = self.get_parameter
+        params = {}
+        for name in (
+                'bayesian_prior_safe',
+                'bayesian_prior_unsafe',
+                'bayesian_ramp_low',
+                'bayesian_ramp_high',
+                'bayesian_min_scale',
+                'bayesian_hold_threshold',
+                'bayesian_emergency_force_margin',
+                'bayesian_emergency_contact_fraction',
+        ):
+            params[name[len('bayesian_'):]] = float(gp(name).value)
+        for prefix in (
+                'bayesian_mean_safe',
+                'bayesian_mean_unsafe',
+                'bayesian_sigma_safe',
+                'bayesian_sigma_unsafe',
+        ):
+            tail = prefix[len('bayesian_'):]
+            for feature in (
+                    'force_margin', 'contact_fraction',
+                    'safety_pressure', 'edge_clearance_norm',
+                    'level_pressure'):
+                params[f'{tail}_{feature}'] = float(
+                    gp(f'{prefix}_{feature}').value)
+        return params
+
+    def _reload_bayesian_model(self) -> bool:
+        """Rebuild the Bayesian model from the current ``bayesian_*`` params."""
+        try:
+            self.bayesian_model = BayesianMotionModel.from_mapping(
+                self._bayesian_parameter_mapping())
+        except (TypeError, ValueError) as exc:
+            self.get_logger().error(
+                f'Bayesian model reload failed: {exc}; keeping previous model.')
+            return False
+        self.bayesian_posterior = 1.0
+        self.bayesian_speed_scale = 1.0
+        self.bayesian_hold = False
+        self.bayesian_emergency_hold = False
+        self.bayesian_feature_log_likelihoods = {}
+        self.bayesian_log_likelihoods = {}
+        self._last_bayesian_update_t = None
+        self.get_logger().info(
+            'Bayesian smooth motion model (re)loaded.')
+        return True
+
+    def _reload_bayesian_model_srv_cb(self, request, response):
+        ok = self._reload_bayesian_model()
+        response.success = ok
+        if ok and self.bayesian_model is not None:
+            cfg = self.bayesian_model.describe_config()
+            response.message = (
+                f'posterior_safe prior={cfg["prior_safe"]:.2f}, '
+                f'min_scale={cfg["min_scale"]:.2f}, '
+                f'ramp=[{cfg["ramp_low"]:.2f},{cfg["ramp_high"]:.2f}]')
+        else:
+            response.message = 'Bayesian model reload failed; see node logs'
+        return response
+
+    def _update_bayesian_model(self, projection):
+        """Run the Bayesian model on the current observation and store state.
+
+        The model is the same one returned by ``BayesianMotionModel``;
+        we keep a low-pass filtered posterior for additional smoothness.
+        """
+        if self.bayesian_model is None:
+            return
+        current_safety = self.last_safety.get('current', {}) if self.last_safety else {}
+        if (projection is None or
+                not isinstance(current_safety, dict)):
+            return
+        if not math.isfinite(current_safety.get('margin', float('inf'))):
+            force_margin = 5.0
+        else:
+            force_margin = float(current_safety['margin'])
+        observation = build_observation(
+            force_margin=force_margin,
+            contact_fraction=float(self.avg_contact_fraction),
+            boundary_risk=float(self.boundary_risk),
+            edge_clearance=float(self.edge_clearance_m),
+            edge_margin=float(self.edge_margin),
+            load_fraction=float(current_safety.get('load_fraction', 0.0)),
+        )
+        decision = self.bayesian_model.decide(observation)
+        # Optional low-pass filter on the posterior for extra smoothness.
+        now = self.get_clock().now()
+        if (self.bayesian_posterior_tau_s > 0.0 and
+                self._last_bayesian_update_t is not None):
+            dt = (now - self._last_bayesian_update_t).nanoseconds * 1e-9
+            alpha = 1.0 - math.exp(
+                -max(0.0, dt) / self.bayesian_posterior_tau_s)
+            self.bayesian_posterior = (
+                (1.0 - alpha) * self.bayesian_posterior +
+                alpha * decision.posterior_safe)
+        else:
+            self.bayesian_posterior = decision.posterior_safe
+        self._last_bayesian_update_t = now
+        # Re-decide with the filtered posterior so the speed scale
+        # matches the value shown in the debug topic.
+        if self.bayesian_posterior_tau_s > 0.0:
+            filtered_decision = self.bayesian_model.update().decide(
+                observation)
+            # Apply the smoothstep manually on the filtered posterior
+            # so we don't recompute Gaussians needlessly.
+            cfg = self.bayesian_model.config
+            from bayesian_motion_model import _smoothstep  # local import
+            self.bayesian_speed_scale = (
+                cfg.min_scale + (1.0 - cfg.min_scale) * _smoothstep(
+                    self.bayesian_posterior, cfg.ramp_low, cfg.ramp_high))
+            self.bayesian_hold = self.bayesian_posterior < cfg.hold_threshold
+            self.bayesian_emergency_hold = (
+                observation.force_margin < cfg.emergency_force_margin or
+                observation.contact_fraction < cfg.emergency_contact_fraction)
+        else:
+            self.bayesian_speed_scale = decision.speed_scale
+            self.bayesian_hold = decision.hold
+            self.bayesian_emergency_hold = decision.emergency_hold
+        self.bayesian_feature_log_likelihoods = dict(
+            decision.feature_log_likelihoods)
+        self.bayesian_log_likelihoods = dict(decision.log_likelihoods)
+
     def _experimental_polygon_graph(self) -> SurfaceGraph:
         surfaces = []
         for item in self._experimental_polygon_surfaces():
@@ -526,9 +721,35 @@ class SurfaceGoalPlanner(Node):
         self.last_status_t = self.get_clock().now()
 
     def _clicked_cb(self, msg: PointStamped):
+        in_frame = msg.header.frame_id or self.world_frame
+        # If the Publish Point click arrived in a non-world frame,
+        # transform the point into the planner's world_frame so the
+        # goal projects onto the pipe surface correctly.
+        if in_frame and in_frame != self.world_frame:
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.world_frame, in_frame, Time(),
+                    timeout=Duration(seconds=self.tf_timeout))
+                t = tf.transform.translation
+                q = tf.transform.rotation
+                pt = _quat_rotate(q.x, q.y, q.z, q.w,
+                                  msg.point.x, msg.point.y, msg.point.z)
+                wx = t.x + pt[0]
+                wy = t.y + pt[1]
+                wz = t.z + pt[2]
+                self.get_logger().info(
+                    f'Received /clicked_point in frame "{in_frame}"; '
+                    f'transformed to {self.world_frame}: '
+                    f'({wx:.3f}, {wy:.3f}, {wz:.3f})')
+                self._set_goal_from_world_point(wx, wy, wz, 'Publish Point')
+                return
+            except TransformException as exc:
+                self.get_logger().warn(
+                    f'Cannot transform click from {in_frame} to '
+                    f'{self.world_frame}: {exc}; using raw coords.')
         self.get_logger().info(
             f'Received /clicked_point in frame '
-            f'"{msg.header.frame_id or "<empty>"}": '
+            f'"{in_frame}": '
             f'({msg.point.x:.3f}, {msg.point.y:.3f}, {msg.point.z:.3f})')
         self._set_goal_from_world_point(
             msg.point.x, msg.point.y, msg.point.z, 'Publish Point')
@@ -933,6 +1154,19 @@ class SurfaceGoalPlanner(Node):
                 f'unsafe target: {target_safety["reason"]}')
             return
 
+        # Update the Bayesian smooth motion model now that the
+        # classical safety gates have accepted the current pose.  The
+        # model can still veto the motion with ``emergency_hold`` (for
+        # catastrophic single-feature failures) and modulates the
+        # speed scale everywhere else via ``bayesian_speed_scale``.
+        self._update_bayesian_model(current_projection)
+        if (self.bayesian_replace_boundary_hold and
+                self.bayesian_emergency_hold):
+            self._publish_body_cmd(
+                0.0, 0.0, 0.0,
+                'bayesian emergency hold')
+            return
+
         route_target = self._route_target(current_projection)
         if route_target is None:
             self._publish_body_cmd(0.0, 0.0, 0.0, 'no route target')
@@ -974,11 +1208,19 @@ class SurfaceGoalPlanner(Node):
             self.kp_theta * v_err * v_scale,
             -self.curve_speed, self.curve_speed)
         edge_scale = self._edge_motion_scale((rx, ry, rz))
-        wx = edge_scale * (
+        # The Bayesian model's smooth speed scaler modulates the
+        # commanded velocity multiplicatively.  Multiplying by the
+        # edge ramp preserves the per-feature safety semantics while
+        # giving the planner a single C^0-continuous speed curve.
+        bayes_scale = (
+            self.bayesian_speed_scale if self.bayesian_speed_enabled
+            and self.bayesian_model is not None else 1.0)
+        total_scale = edge_scale * bayes_scale
+        wx = total_scale * (
             axis_speed * tangent_u[0] + curve_speed * tangent_v[0])
-        wy = edge_scale * (
+        wy = total_scale * (
             axis_speed * tangent_u[1] + curve_speed * tangent_v[1])
-        wz = edge_scale * (
+        wz = total_scale * (
             axis_speed * tangent_u[2] + curve_speed * tangent_v[2])
         self._publish_world_cmd(wx, wy, wz, 'surface_graph')
 
@@ -1234,6 +1476,17 @@ class SurfaceGoalPlanner(Node):
             'edge_clearance_m': self.edge_clearance_m,
             'edge_motion_scale': self.edge_motion_scale,
             'edge_margin_m': self.edge_margin,
+            'bayesian_speed_enabled': self.bayesian_speed_enabled,
+            'bayesian_replace_boundary_hold':
+                self.bayesian_replace_boundary_hold,
+            'bayesian_posterior': self.bayesian_posterior,
+            'bayesian_speed_scale': self.bayesian_speed_scale,
+            'bayesian_hold': self.bayesian_hold,
+            'bayesian_emergency_hold': self.bayesian_emergency_hold,
+            'bayesian_feature_log_likelihoods':
+                dict(self.bayesian_feature_log_likelihoods),
+            'bayesian_log_likelihoods': dict(self.bayesian_log_likelihoods),
+            'bayesian_posterior_tau_s': self.bayesian_posterior_tau_s,
             'cmd_body': [x, y, wz],
         })
         self.debug_pub.publish(dbg)
@@ -1266,9 +1519,17 @@ class SurfaceGoalPlanner(Node):
             route = self._route_marker(stamp)
             if route is not None:
                 markers.markers.append(route)
+                # Also publish a small "start" SPHERE on the pipe at
+                # the route's first waypoint so the operator can see
+                # where the planned path begins.
+                start_marker = self._route_start_marker(stamp)
+                if start_marker is not None:
+                    markers.markers.append(start_marker)
             else:
                 markers.markers.append(
                     self._delete_marker(stamp, 'surface_goal_route', 3))
+                markers.markers.append(
+                    self._delete_marker(stamp, 'surface_goal_route', 5))
         else:
             markers.markers.append(
                 self._delete_marker(stamp, 'surface_goal', 2))
@@ -1276,6 +1537,8 @@ class SurfaceGoalPlanner(Node):
                 self._delete_marker(stamp, 'surface_goal', 4))
             markers.markers.append(
                 self._delete_marker(stamp, 'surface_goal_route', 3))
+            markers.markers.append(
+                self._delete_marker(stamp, 'surface_goal_route', 5))
         self.marker_pub.publish(markers)
 
     def _delete_marker(self, stamp, ns, marker_id):
@@ -1296,15 +1559,18 @@ class SurfaceGoalPlanner(Node):
         marker.type = Marker.LINE_LIST
         marker.action = Marker.ADD
         marker.pose.orientation.w = 1.0
-        marker.scale.x = 0.012
+        marker.scale.x = 0.010
         marker.color.r = 0.52
         marker.color.g = 0.62
         marker.color.b = 0.66
-        marker.color.a = 0.75
+        marker.color.a = 1.0
         axis_center = self._legacy_axis_value(*self.axis_point)
         half_len = 0.5 * self.length
-        ring_count = 9
-        segment_count = 48
+        # Higher grid density gives the operator a much richer view
+        # of the cylinder surface and improves RViz Publish Point
+        # hit accuracy on the legacy single-cylinder surface.
+        ring_count = 18
+        segment_count = 96
         for ring_i in range(ring_count):
             axis_value = (
                 axis_center - half_len +
@@ -1352,7 +1618,7 @@ class SurfaceGoalPlanner(Node):
         marker.color.r = 0.34
         marker.color.g = 0.025
         marker.color.b = 0.030
-        marker.color.a = 0.86
+        marker.color.a = 1.0
         return marker
 
     def _polygon_face_marker(self, stamp, marker_id, surface):
@@ -1369,12 +1635,12 @@ class SurfaceGoalPlanner(Node):
             marker.color.r = 0.0
             marker.color.g = 0.85
             marker.color.b = 1.0
-            marker.color.a = 0.95
+            marker.color.a = 1.0
         else:
             marker.color.r = 0.72
             marker.color.g = 0.52
             marker.color.b = 0.22
-            marker.color.a = 0.85
+            marker.color.a = 1.0
         for i, p0 in enumerate(surface.vertices3):
             p1 = surface.vertices3[(i + 1) % len(surface.vertices3)]
             marker.points.append(Point(x=p0[0], y=p0[1], z=p0[2]))
@@ -1395,19 +1661,22 @@ class SurfaceGoalPlanner(Node):
             marker.color.r = 0.0
             marker.color.g = 0.85
             marker.color.b = 1.0
-            marker.color.a = 0.95
+            marker.color.a = 1.0
         else:
             marker.color.r = 0.90
             marker.color.g = 0.76
             marker.color.b = 0.16
-            marker.color.a = 0.85
+            marker.color.a = 1.0
 
         radius = surface.radius + 0.01
         axis_center = self._cylinder_axis_value(
             surface.axis, *surface.axis_point)
         half_len = 0.5 * surface.length
-        ring_count = 9
-        segment_count = 48
+        # Higher grid density so the per-cylinder surface overlay is
+        # rich enough for smooth Publish Point interaction and for
+        # the operator to read off the planned trajectory.
+        ring_count = 20
+        segment_count = 96
 
         for ring_i in range(ring_count):
             axis_value = (
@@ -1579,11 +1848,12 @@ class SurfaceGoalPlanner(Node):
             marker.type = Marker.LINE_STRIP
             marker.action = Marker.ADD
             marker.pose.orientation.w = 1.0
-            marker.scale.x = 0.035
-            marker.color.r = 0.1
-            marker.color.g = 1.0
+            # Thicker line so the planned path is clearly visible.
+            marker.scale.x = 0.060
+            marker.color.r = 0.10
+            marker.color.g = 1.00
             marker.color.b = 0.35
-            marker.color.a = 0.95
+            marker.color.a = 1.00
             marker.points.append(Point(
                 x=start_point[0], y=start_point[1], z=start_point[2]))
             # Append every remaining waypoint strictly after the
@@ -1610,11 +1880,12 @@ class SurfaceGoalPlanner(Node):
             marker.type = Marker.LINE_STRIP
             marker.action = Marker.ADD
             marker.pose.orientation.w = 1.0
-            marker.scale.x = 0.035
-            marker.color.r = 0.1
-            marker.color.g = 1.0
+            # Thicker line so the planned path is clearly visible.
+            marker.scale.x = 0.060
+            marker.color.r = 0.10
+            marker.color.g = 1.00
             marker.color.b = 0.35
-            marker.color.a = 0.95
+            marker.color.a = 1.00
             for i in range(25):
                 ratio = i / 24.0
                 theta = start_theta + theta_err * ratio
@@ -1624,6 +1895,33 @@ class SurfaceGoalPlanner(Node):
                 marker.points.append(Point(x=x, y=y, z=z))
             return marker
         return None
+
+
+    def _route_start_marker(self, stamp):
+        """Return a small SPHERE at the route's first waypoint so the
+        operator can see where the path begins on the pipe."""
+        if not self.route_points:
+            return None
+        x, y, z = self.route_points[self.route_index].point
+        marker = Marker()
+        marker.header.frame_id = self.world_frame
+        marker.header.stamp = stamp
+        marker.ns = 'surface_goal_route'
+        marker.id = 5
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = z
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.10
+        marker.scale.y = 0.10
+        marker.scale.z = 0.10
+        marker.color.r = 0.20
+        marker.color.g = 0.95
+        marker.color.b = 0.40
+        marker.color.a = 1.00
+        return marker
 
 
 def main(args=None):

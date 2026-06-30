@@ -192,10 +192,10 @@ class ClimbRvizGoalBridge(Node):
                 z=self.panel_center_z - self.spawn_z,
                 sx=self.panel_thickness, sy=self.panel_width, sz=self.panel_height,
                 rgba=(0.63, 0.07, 0.08, 0.55)),
-            self._line(now),
         ])
 
         if self.selected_point is not None:
+            markers.markers.append(self._route_marker(now))
             markers.markers.append(self._selected_marker(now))
 
         self.marker_pub.publish(markers)
@@ -226,7 +226,7 @@ class ClimbRvizGoalBridge(Node):
         marker.color.a = rgba[3]
         return marker
 
-    def _line(self, stamp):
+    def _route_marker(self, stamp):
         marker = Marker()
         marker.header.frame_id = self.marker_frame
         marker.header.stamp = stamp
@@ -240,16 +240,60 @@ class ClimbRvizGoalBridge(Node):
         marker.color.g = 0.85
         marker.color.b = 1.0
         marker.color.a = 0.95
-        panel_top = self.panel_center_z + self.panel_height * 0.5
-        points = [
-            (0.0, 0.0, 0.03),
-            (self.slide_start_x - self.spawn_x, 0.0, self.slide_start_z + 0.03),
-            (self.slide_wall_x - self.spawn_x, 0.0, self.wall_entry_z + 0.03),
-            (self.slide_wall_x - self.spawn_x, 0.0, panel_top),
-        ]
-        for x, y, z in points:
+        for x, y, z in self._route_points_to_selected():
             marker.points.append(Point(x=x, y=y, z=z))
         return marker
+
+    def _route_points_to_selected(self):
+        if self.selected_point is None:
+            return []
+
+        sx, sy, sz = self.selected_point
+        world_x = sx + self.spawn_x
+        world_y = sy + self.spawn_y
+        world_z = sz + self.spawn_z
+        _, _, surface = self._surface_goal(world_x, world_y, world_z)
+        route_z = 0.03
+        panel_top = self.panel_center_z + self.panel_height * 0.5
+        wall_face_x = self.panel_center_x - self.panel_thickness * 0.5
+        goal_y = _clamp(world_y, -self.panel_width * 0.5, self.panel_width * 0.5)
+
+        points = [(0.0, 0.0, route_z)]
+        if surface == 'ground':
+            points.append((sx, sy, route_z))
+            return points
+
+        slide_start = (
+            self.slide_start_x - self.spawn_x,
+            0.0,
+            self.slide_start_z - self.spawn_z + route_z)
+        points.append(slide_start)
+
+        if surface == 'slide':
+            slide_dir_x = math.cos(self.slide_angle)
+            slide_dir_z = math.sin(self.slide_angle)
+            dx = world_x - self.slide_start_x
+            dz = world_z - self.slide_start_z
+            slide_s = _clamp(
+                dx * slide_dir_x + dz * slide_dir_z,
+                0.0,
+                self.slide_progress)
+            points.append((
+                self.slide_start_x + slide_s * slide_dir_x - self.spawn_x,
+                _clamp(world_y, -self.slide_width * 0.5, self.slide_width * 0.5) - self.spawn_y,
+                self.slide_start_z + slide_s * slide_dir_z - self.spawn_z + route_z))
+            return points
+
+        points.append((
+            self.slide_wall_x - self.spawn_x,
+            0.0,
+            self.wall_entry_z - self.spawn_z + route_z))
+        wall_z = _clamp(world_z, self.wall_entry_z, panel_top)
+        points.append((
+            wall_face_x - self.spawn_x,
+            goal_y - self.spawn_y,
+            wall_z - self.spawn_z))
+        return points
 
     def _selected_marker(self, stamp):
         x, y, z = self.selected_point
