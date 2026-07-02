@@ -161,6 +161,7 @@ BAYESIAN_FEATURE_KEYS = (
     'safety_pressure',
     'edge_clearance_norm',
     'level_pressure',
+    'steering_stability',
 )
 
 BAYESIAN_FEATURE_LABELS = {
@@ -169,6 +170,7 @@ BAYESIAN_FEATURE_LABELS = {
     'safety_pressure': 'Safety pressure',
     'edge_clearance_norm': 'Edge clearance',
     'level_pressure': 'Level pressure',
+    'steering_stability': 'Steering stability',
 }
 
 

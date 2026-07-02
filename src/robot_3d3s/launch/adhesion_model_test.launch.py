@@ -117,6 +117,7 @@ def generate_launch_description():
     start_monitor = LaunchConfiguration('start_monitor')
     use_surface_planner = LaunchConfiguration('use_surface_planner')
     use_rviz = LaunchConfiguration('use_rviz')
+    show_scene_markers = LaunchConfiguration('show_scene_markers')
     use_gazebo_gui = LaunchConfiguration('use_gazebo_gui')
     rviz_config = LaunchConfiguration('rviz_config')
     spawn_x = LaunchConfiguration('spawn_x')
@@ -236,7 +237,7 @@ def generate_launch_description():
         package='robot_3d3s',
         executable='adhesion_scene_rviz.py',
         name='adhesion_scene_rviz',
-        condition=IfCondition(use_rviz),
+        condition=IfCondition(show_scene_markers),
         output='screen',
         parameters=[{
             'use_sim_time': True,
@@ -438,7 +439,9 @@ def generate_launch_description():
         DeclareLaunchArgument('use_surface_planner', default_value='true',
                               description='Enable unified surface goal planner for the vertical pipe.'),
         DeclareLaunchArgument('use_rviz', default_value='true',
-                              description='Start RViz with adhesion model scene markers.'),
+                              description='Start RViz with the pipe surface goal marker display.'),
+        DeclareLaunchArgument('show_scene_markers', default_value='false',
+                              description='Optionally publish legacy adhesion scene markers on /adhesion_model_markers. RViz does not display them by default.'),
         DeclareLaunchArgument('use_gazebo_gui', default_value='false',
                               description='Start Gazebo GUI. False runs Gazebo server only and visualizes in RViz.'),
         DeclareLaunchArgument('rviz_config', default_value=default_rviz_config,

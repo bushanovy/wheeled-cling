@@ -40,6 +40,7 @@ def _safe_observation(**overrides):
         safety_pressure=0.95,
         edge_clearance_norm=0.95,
         level_pressure=0.95,
+        steering_stability=0.95,
     )
     base.update(overrides)
     return BayesianMotionObservation(**base)
@@ -93,6 +94,7 @@ def test_speed_scale_is_monotonic_in_each_feature():
         "safety_pressure",
         "edge_clearance_norm",
         "level_pressure",
+        "steering_stability",
     ):
         last = -1.0
         for v in (0.0, 0.25, 0.5, 0.75, 1.0):
@@ -101,6 +103,24 @@ def test_speed_scale_is_monotonic_in_each_feature():
                 f"non-monotonic in {field} at v={v}: {decision.speed_scale}"
             )
             last = decision.speed_scale
+
+
+def test_steering_instability_reduces_speed_scale():
+    model = BayesianMotionModel()
+    base = dict(
+        force_margin=0.75,
+        contact_fraction=0.60,
+        safety_pressure=0.65,
+        edge_clearance_norm=0.65,
+        level_pressure=0.65,
+    )
+    stable = model.decide(
+        _safe_observation(**base, steering_stability=1.0))
+    unstable = model.decide(
+        _safe_observation(**base, steering_stability=0.0))
+
+    assert unstable.posterior_safe < stable.posterior_safe
+    assert unstable.speed_scale < stable.speed_scale
 
 
 def test_speed_scale_bounded_by_min_scale():
@@ -238,12 +258,14 @@ def test_build_observation_normalizes_edge_clearance():
         edge_clearance=0.05,
         edge_margin=0.10,
         load_fraction=0.4,
+        steering_change_norm=0.25,
     )
     assert math.isclose(obs.force_margin, 1.2)
     assert math.isclose(obs.contact_fraction, 0.7)
     assert math.isclose(obs.safety_pressure, 0.8)
     assert math.isclose(obs.edge_clearance_norm, 0.5)
     assert math.isclose(obs.level_pressure, 0.6)
+    assert math.isclose(obs.steering_stability, 0.75)
 
 
 def test_build_observation_handles_undefined_edge_clearance():
@@ -254,6 +276,7 @@ def test_build_observation_handles_undefined_edge_clearance():
         edge_clearance=float("inf"),
         edge_margin=0.10,
         load_fraction=0.5,
+        steering_change_norm=0.0,
     )
     assert obs.edge_clearance_norm == 1.0
 
@@ -264,6 +287,7 @@ def test_build_observation_handles_undefined_edge_clearance():
         edge_clearance=-0.01,
         edge_margin=0.10,
         load_fraction=0.5,
+        steering_change_norm=1.5,
     )
     assert obs.edge_clearance_norm == 0.0
 
@@ -276,10 +300,12 @@ def test_build_observation_clamps_inputs_to_unit_interval():
         edge_clearance=0.10,
         edge_margin=0.10,
         load_fraction=1.5,
+        steering_change_norm=1.5,
     )
     assert obs.contact_fraction == 1.0
     assert obs.safety_pressure == 1.0
     assert obs.level_pressure == 0.0
+    assert obs.steering_stability == 0.0
 
 
 def test_from_mapping_overrides_individual_parameters():
@@ -331,6 +357,7 @@ def test_serialize_decision_returns_json_with_expected_keys():
             "safety_pressure": 0.0,
             "edge_clearance_norm": 0.0,
             "level_pressure": 0.0,
+            "steering_stability": 0.0,
         },
     )
     import json
@@ -350,6 +377,7 @@ def test_serialize_decision_returns_json_with_expected_keys():
         "safety_pressure",
         "edge_clearance_norm",
         "level_pressure",
+        "steering_stability",
     }
 
 
@@ -362,9 +390,10 @@ def test_describe_config_round_trips_to_dict():
         "safety_pressure",
         "edge_clearance_norm",
         "level_pressure",
+        "steering_stability",
     ]
-    assert len(cfg_dict["mean_safe"]) == 5
-    assert len(cfg_dict["sigma_unsafe"]) == 5
+    assert len(cfg_dict["mean_safe"]) == 6
+    assert len(cfg_dict["sigma_unsafe"]) == 6
 
 
 def test_update_returns_new_model_without_mutation():
@@ -385,7 +414,7 @@ def test_invalid_config_rejected():
     with pytest.raises(ValueError):
         BayesianMotionConfig(ramp_low=0.9, ramp_high=0.5)
     with pytest.raises(ValueError):
-        BayesianMotionConfig(sigma_safe=(0.1, 0.0, 0.2, 0.3, 0.4))
+        BayesianMotionConfig(sigma_safe=(0.1, 0.0, 0.2, 0.3, 0.4, 0.5))
 
 
 def test_speed_scale_strictly_above_min_for_marginal_observations():

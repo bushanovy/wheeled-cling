@@ -13,6 +13,9 @@ from surface_geometry import (  # noqa: E402
     edge_motion_scale,
     footprint_edge_clearance,
     graph_from_yaml,
+    heading_alignment_scale,
+    quat_rotate,
+    rate_limited_heading,
 )
 
 
@@ -109,6 +112,15 @@ def test_surface_graph_picks_nearest_surface():
     assert projection.surface.name == "pipe"
 
 
+def test_quat_rotate_handles_pitch_rotation():
+    half = math.sqrt(0.5)
+    rotated = quat_rotate((0.0, half, 0.0, half), (0.0, 0.0, 1.0))
+
+    assert math.isclose(rotated[0], 1.0, abs_tol=1e-9)
+    assert math.isclose(rotated[1], 0.0, abs_tol=1e-9)
+    assert math.isclose(rotated[2], 0.0, abs_tol=1e-9)
+
+
 def test_astar_chooses_lower_risk_transition_path():
     start_surface = PolygonSurface("start", [
         (0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
@@ -151,6 +163,49 @@ def test_astar_chooses_lower_risk_transition_path():
     assert graph.last_route.components["transition"] < 10.0
 
 
+def test_astar_prefers_stronger_contact_route():
+    start_surface = PolygonSurface("start", [
+        (0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0), (0.0, 1.0, 0.0),
+    ])
+    low_contact = PolygonSurface("low_contact", [
+        (1.0, 0.0, 0.0), (2.0, 0.0, 0.0),
+        (2.0, 1.0, 0.0), (1.0, 1.0, 0.0),
+    ])
+    high_contact = PolygonSurface("high_contact", [
+        (1.0, -1.4, 0.0), (2.0, -1.4, 0.0),
+        (2.0, -0.4, 0.0), (1.0, -0.4, 0.0),
+    ])
+    goal_surface = PolygonSurface("goal", [
+        (2.0, 0.0, 0.0), (3.0, 0.0, 0.0),
+        (3.0, 1.0, 0.0), (2.0, 1.0, 0.0),
+    ])
+    low_contact.contact_quality = 0.20
+    high_contact.contact_quality = 1.0
+
+    graph = SurfaceGraph(
+        [start_surface, low_contact, high_contact, goal_surface],
+        transitions=[
+            {"from": "start", "to": "low_contact", "cost": 0.5,
+             "point": [1.0, 0.5, 0.0]},
+            {"from": "low_contact", "to": "goal", "cost": 0.5,
+             "point": [2.0, 0.5, 0.0]},
+            {"from": "start", "to": "high_contact", "cost": 0.5,
+             "point": [1.0, 0.0, 0.0]},
+            {"from": "high_contact", "to": "goal", "cost": 0.5,
+             "point": [2.0, 0.0, 0.0]},
+        ],
+        cost_weights={"contact": 8.0, "heuristic": 0.1},
+    )
+
+    start = start_surface.project((0.2, 0.5, 0.0))
+    goal = goal_surface.project((2.8, 0.5, 0.0))
+
+    assert graph.astar_surface_path(start, goal) == [
+        "start", "high_contact", "goal"]
+    assert graph.last_route.components["contact"] == 0.0
+
+
 def test_footprint_edge_clearance_uses_all_three_wheels():
     surface = PolygonSurface("panel", [
         (0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
@@ -177,3 +232,36 @@ def test_edge_motion_scale_slows_and_holds_near_edges():
     assert edge_motion_scale(0.05, 0.10, 0.25) == 0.5
     assert edge_motion_scale(0.01, 0.10, 0.25) == 0.25
     assert edge_motion_scale(-0.01, 0.10, 0.25) == 0.0
+
+
+def test_rate_limited_heading_ignores_small_jitter():
+    heading, error = rate_limited_heading(
+        previous=0.50,
+        desired=0.55,
+        dt=0.1,
+        max_rate=1.0,
+        deadband=0.10)
+
+    assert math.isclose(heading, 0.50)
+    assert math.isclose(error, 0.05)
+
+
+def test_rate_limited_heading_restricts_large_turns():
+    heading, error = rate_limited_heading(
+        previous=0.0,
+        desired=math.pi / 2.0,
+        dt=0.1,
+        max_rate=0.8,
+        deadband=0.10)
+
+    assert math.isclose(heading, 0.08)
+    assert math.isclose(error, math.pi / 2.0)
+
+
+def test_heading_alignment_scale_slows_large_heading_errors():
+    assert heading_alignment_scale(0.0, 0.20) == 1.0
+    assert math.isclose(
+        heading_alignment_scale(math.pi / 3.0, 0.20),
+        0.5,
+        abs_tol=1e-9)
+    assert heading_alignment_scale(math.pi, 0.20) == 0.20

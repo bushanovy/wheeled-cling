@@ -74,6 +74,7 @@ Visualization Manager:
       Name: HorizontalPipeMarkers
       Namespaces:
         pipe_surface_grid: true
+        surface_goal_surface: true
         surface_goal: true
         surface_goal_route: true
       Topic:

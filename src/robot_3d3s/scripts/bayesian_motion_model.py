@@ -30,7 +30,7 @@ state $S \\in \\{\\mathrm{safe}, \\mathrm{unsafe}\\}$.
 The observation vector is
 
 $$
-\\mathbf{x} = (x_1, x_2, x_3, x_4, x_5)
+\\mathbf{x} = (x_1, x_2, x_3, x_4, x_5, x_6)
 $$
 
 where every component is normalized so that **larger is safer**:
@@ -47,24 +47,27 @@ where every component is normalized so that **larger is safer**:
 * $x_5 = 1 - \\mathrm{load\\_fraction}$ - the fraction of the gravity
   load that is tangential to the surface (i.e. $1 - \\sqrt{1-n_z^2}$
   in surface-normal coordinates, with larger = flatter / safer).
+* $x_6 = 1 - \\mathrm{steering\\_change\\_norm}$ - normalized steering
+  stability, where larger means the next command keeps the swerve wheel
+  angles close to the previous useful command.
 
 For each class $c \\in \\{\\mathrm{safe}, \\mathrm{unsafe}\\}$ the
 likelihood of an observation is a product of one-dimensional Gaussians
 
 $$
-P(\\mathbf{x} \\mid c) = \\prod_{i=1}^{5}
+P(\\mathbf{x} \\mid c) = \\prod_{i=1}^{6}
     \\frac{1}{\\sqrt{2\\pi}\\,\\sigma_{i,c}}
     \\exp\\!\\left(-\\frac{(x_i - \\mu_{i,c})^2}{2\\sigma_{i,c}^2}\\right).
 $$
 
 The class means encode the *typical* values of each feature under the
-two classes (e.g. $\\mu_{\\mathrm{safe}} = (1.5, 0.9, 0.95, 0.9, 0.95)$
-and $\\mu_{\\mathrm{unsafe}} = (0.2, 0.1, 0.2, 0.1, 0.1)$); the sigmas
+two classes (e.g. $\\mu_{\\mathrm{safe}} = (1.5, 0.9, 0.95, 0.9, 0.95, 0.95)$
+and $\\mu_{\\mathrm{unsafe}} = (0.2, 0.1, 0.2, 0.1, 0.1, 0.15)$); the sigmas
 encode how much variation in each feature is still consistent with
 each class.  We work in the log domain for numerical stability:
 
 $$
-\\log P(c \\mid \\mathbf{x}) = \\log P(c) + \\sum_{i=1}^{5}
+\\log P(c \\mid \\mathbf{x}) = \\log P(c) + \\sum_{i=1}^{6}
     \\left[ -\\frac{(x_i - \\mu_{i,c})^2}{2\\sigma_{i,c}^2}
               -\\log(\\sqrt{2\\pi}\\,\\sigma_{i,c}) \\right]
 $$
@@ -157,7 +160,7 @@ def _smoothstep(x: float, edge0: float, edge1: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-#: Names of the five observation features, in the order the model
+#: Names of the observation features, in the order the model
 #: expects them in its per-class mean/sigma vectors.
 _FEATURE_NAMES = (
     "force_margin",
@@ -165,6 +168,7 @@ _FEATURE_NAMES = (
     "safety_pressure",
     "edge_clearance_norm",
     "level_pressure",
+    "steering_stability",
 )
 
 
@@ -183,17 +187,17 @@ class BayesianMotionConfig:
 
     # Means per class, per feature.  Order is
     # (force_margin, contact_fraction, 1 - boundary_risk,
-    #  edge_clearance_norm, 1 - load_fraction).
-    mean_safe: tuple = (1.5, 0.90, 0.95, 0.90, 0.95)
-    mean_unsafe: tuple = (0.20, 0.10, 0.20, 0.10, 0.10)
+    #  edge_clearance_norm, 1 - load_fraction, steering_stability).
+    mean_safe: tuple = (1.5, 0.90, 0.95, 0.90, 0.95, 0.95)
+    mean_unsafe: tuple = (0.20, 0.10, 0.20, 0.10, 0.10, 0.15)
 
     # Sigmas per class, per feature.  Larger sigma means the model
     # tolerates more variation in that feature for that class.  The
     # defaults express the fact that the "safe" class is much stricter
     # about force margin than about edge clearance (which can be small
     # without being unsafe if other features are healthy).
-    sigma_safe: tuple = (0.50, 0.20, 0.20, 0.30, 0.25)
-    sigma_unsafe: tuple = (0.35, 0.25, 0.25, 0.25, 0.25)
+    sigma_safe: tuple = (0.50, 0.20, 0.20, 0.30, 0.25, 0.20)
+    sigma_unsafe: tuple = (0.35, 0.25, 0.25, 0.25, 0.25, 0.30)
 
     # Posterior -> speed scale mapping.  P >= ramp_high -> full speed;
     # P <= ramp_low -> min_scale.  Between the two, smoothstep.
@@ -239,13 +243,14 @@ class BayesianMotionConfig:
 
 @dataclass
 class BayesianMotionObservation:
-    """The five features consumed by the model, in the model's order."""
+    """The features consumed by the model, in the model's order."""
 
     force_margin: float
     contact_fraction: float
     safety_pressure: float
     edge_clearance_norm: float
     level_pressure: float
+    steering_stability: float = 1.0
 
     def as_vector(self) -> tuple:
         return (
@@ -254,6 +259,7 @@ class BayesianMotionObservation:
             _clamp(float(self.safety_pressure), 0.0, 1.0),
             _clamp(float(self.edge_clearance_norm), 0.0, 1.0),
             _clamp(float(self.level_pressure), 0.0, 1.0),
+            _clamp(float(self.steering_stability), 0.0, 1.0),
         )
 
 
@@ -469,6 +475,7 @@ def build_observation(
         edge_clearance: float,
         edge_margin: float,
         load_fraction: float,
+        steering_change_norm: float = 0.0,
         ) -> BayesianMotionObservation:
     """Convert planner-level quantities into a model observation.
 
@@ -491,6 +498,7 @@ def build_observation(
         safety_pressure=_clamp(1.0 - float(boundary_risk), 0.0, 1.0),
         edge_clearance_norm=edge_norm,
         level_pressure=_clamp(1.0 - float(load_fraction), 0.0, 1.0),
+        steering_stability=_clamp(1.0 - float(steering_change_norm), 0.0, 1.0),
     )
 
 

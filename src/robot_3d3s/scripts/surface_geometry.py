@@ -21,6 +21,36 @@ def wrap_pi(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+def rate_limited_heading(
+        previous: Optional[float],
+        desired: float,
+        dt: float,
+        max_rate: float,
+        deadband: float = 0.0) -> Tuple[float, float]:
+    """Return a heading limited toward desired plus the original error.
+
+    Small heading errors inside ``deadband`` keep the previous heading.  This
+    avoids steering chatter when the path target jitters by only a few degrees.
+    """
+    desired = wrap_pi(float(desired))
+    if previous is None:
+        return desired, 0.0
+    previous = wrap_pi(float(previous))
+    error = wrap_pi(desired - previous)
+    if abs(error) <= max(0.0, deadband):
+        return previous, error
+    max_delta = max(0.0, float(max_rate)) * max(0.0, float(dt))
+    if max_delta <= 1e-12:
+        return previous, error
+    delta = clamp(error, -max_delta, max_delta)
+    return wrap_pi(previous + delta), error
+
+
+def heading_alignment_scale(error: float, min_scale: float = 0.20) -> float:
+    """Slow translation when held heading is far from desired heading."""
+    return clamp(math.cos(abs(float(error))), min_scale, 1.0)
+
+
 def dot(a: Vec3, b: Vec3) -> float:
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
@@ -142,6 +172,7 @@ class Surface:
         self.name = name
         self.neighbors: List[str] = []
         self.adhesion_quality = 1.0
+        self.contact_quality = 1.0
         self.traversal_cost = 1.0
         self.edge_risk = 0.0
         self.transition_risk = 0.0
@@ -359,9 +390,11 @@ class SurfaceGraph:
             "distance": 1.0,
             "transition": 1.0,
             "adhesion": 2.0,
+            "contact": 2.5,
             "edge": 1.5,
             "gravity": 1.0,
-            "turn": 0.25,
+            "slip": 2.0,
+            "turn": 0.75,
             "heuristic": 1.0,
             "edge_margin_m": 0.10,
         }
@@ -493,6 +526,8 @@ class SurfaceGraph:
         gravity_cost = self._surface_load_fraction(surface, current_uv) * distance_cost
         adhesion_quality = clamp(surface.adhesion_quality, 1e-3, 1.0)
         adhesion_cost = (1.0 / adhesion_quality - 1.0) * distance_cost
+        contact_quality = clamp(surface.contact_quality, 1e-3, 1.0)
+        contact_cost = (1.0 / contact_quality - 1.0) * distance_cost
         edge_cost = self._edge_penalty(exit_projection) + surface.edge_risk
         transition_cost = self.edges.get(current, {}).get(neighbor, 1.0)
         transition_cost += surface.transition_risk + self._transition_risk(current, neighbor)
@@ -503,6 +538,7 @@ class SurfaceGraph:
             "distance": distance_cost * surface.traversal_cost,
             "transition": transition_cost,
             "adhesion": adhesion_cost,
+            "contact": contact_cost,
             "edge": edge_cost,
             "gravity": gravity_cost,
             "slip": slip_cost,
@@ -512,10 +548,11 @@ class SurfaceGraph:
             self.cost_weights["distance"] * components["distance"] +
             self.cost_weights["transition"] * components["transition"] +
             self.cost_weights["adhesion"] * components["adhesion"] +
+            self.cost_weights["contact"] * components["contact"] +
             self.cost_weights["edge"] * components["edge"] +
             self.cost_weights["gravity"] * components["gravity"] +
             self.cost_weights["turn"] * components["turn"] +
-            components["slip"])
+            self.cost_weights["slip"] * components["slip"])
         return total, components, neighbor_entry_uv
 
     def _heuristic(self, name: str, uv: Vec2, goal: SurfaceProjection) -> float:
@@ -531,6 +568,7 @@ class SurfaceGraph:
                         (start.u, start.v), (goal.u, goal.v)),
                     "transition": 0.0,
                     "adhesion": 0.0,
+                    "contact": 0.0,
                     "edge": self._edge_penalty(goal),
                     "gravity": 0.0,
                     "slip": 0.0,
@@ -551,6 +589,7 @@ class SurfaceGraph:
             None,
             [start_name],
             {"distance": 0.0, "transition": 0.0, "adhesion": 0.0,
+             "contact": 0.0,
              "edge": self._edge_penalty(start), "gravity": 0.0,
              "slip": 0.0, "turn": 0.0},
         )]
@@ -569,18 +608,22 @@ class SurfaceGraph:
                 final_gravity = self._surface_load_fraction(surface, current_uv) * final_distance
                 adhesion_quality = clamp(surface.adhesion_quality, 1e-3, 1.0)
                 final_adhesion = (1.0 / adhesion_quality - 1.0) * final_distance
+                contact_quality = clamp(surface.contact_quality, 1e-3, 1.0)
+                final_contact = (1.0 / contact_quality - 1.0) * final_distance
                 final_edge = self._edge_penalty(goal) + surface.edge_risk
                 final_slip = surface.slip_risk * final_distance
                 final_cost = (
                     self.cost_weights["distance"] * final_distance * surface.traversal_cost +
                     self.cost_weights["gravity"] * final_gravity +
                     self.cost_weights["adhesion"] * final_adhesion +
+                    self.cost_weights["contact"] * final_contact +
                     self.cost_weights["edge"] * final_edge +
-                    final_slip)
+                    self.cost_weights["slip"] * final_slip)
                 final_components = dict(components)
                 final_components["distance"] += final_distance
                 final_components["gravity"] += final_gravity
                 final_components["adhesion"] += final_adhesion
+                final_components["contact"] += final_contact
                 final_components["edge"] += final_edge
                 final_components["slip"] += final_slip
                 self.last_route = RouteDiagnostics(
@@ -701,6 +744,9 @@ def surface_from_dict(data: Dict) -> Surface:
         raise ValueError(f"unsupported surface type {stype!r}")
     surface.neighbors = [str(n) for n in data.get("neighbors", [])]
     surface.adhesion_quality = clamp(float(data.get("adhesion_quality", 1.0)), 1e-3, 1.0)
+    surface.contact_quality = clamp(float(data.get(
+        "contact_quality", data.get("wheel_contact_quality",
+                                    surface.adhesion_quality))), 1e-3, 1.0)
     surface.traversal_cost = max(0.0, float(data.get("traversal_cost", 1.0)))
     surface.edge_risk = max(0.0, float(data.get("edge_risk", 0.0)))
     surface.transition_risk = max(0.0, float(data.get("transition_risk", 0.0)))

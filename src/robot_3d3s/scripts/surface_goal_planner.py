@@ -44,6 +44,9 @@ from surface_geometry import (
     edge_motion_scale,
     footprint_edge_clearance,
     graph_from_yaml,
+    heading_alignment_scale,
+    quat_rotate,
+    rate_limited_heading,
 )
 
 
@@ -61,14 +64,7 @@ def _wrap_pi(angle: float):
 
 def _quat_rotate(qx: float, qy: float, qz: float, qw: float,
                  x: float, y: float, z: float) -> Tuple[float, float, float]:
-    tx = 2.0 * (qy * z - qz * y)
-    ty = 2.0 * (qz * x - qx * z)
-    tz = 2.0 * (qx * y - qy * z)
-    return (
-        x + qw * tx + (qy * tz - qz * ty),
-        y + qw * ty + (qz * tx - qx * tz),
-        z + qw * tz + (qx * ty - qy * tx),
-    )
+    return quat_rotate((qx, qy, qz, qw), (x, y, z))
 
 
 def _quat_from_rpy(roll: float, pitch: float, yaw: float):
@@ -111,7 +107,7 @@ class SurfaceGoalPlanner(Node):
         self.declare_parameter('surface_mode', 'auto')
         self.declare_parameter('show_experimental_polygon', False)
         self.declare_parameter('experimental_polygon_goal_selection', False)
-        self.declare_parameter('route_samples_per_surface', 24)
+        self.declare_parameter('route_samples_per_surface', 48)
 
         # Legacy single-cylinder fallback parameters.  Used when no graph
         # YAML is provided.
@@ -156,18 +152,18 @@ class SurfaceGoalPlanner(Node):
         # Means per class per feature: bayesian_<mean|sigma>_<safe|unsafe>_<feature>
         for prefix, vec in (
             ('mean_safe',
-             (1.50, 0.90, 0.95, 0.90, 0.95)),
+             (1.50, 0.90, 0.95, 0.90, 0.95, 0.95)),
             ('mean_unsafe',
-             (0.20, 0.10, 0.20, 0.10, 0.10)),
+             (0.20, 0.10, 0.20, 0.10, 0.10, 0.15)),
             ('sigma_safe',
-             (0.50, 0.20, 0.20, 0.30, 0.25)),
+             (0.50, 0.20, 0.20, 0.30, 0.25, 0.20)),
             ('sigma_unsafe',
-             (0.35, 0.25, 0.25, 0.25, 0.25)),
+             (0.35, 0.25, 0.25, 0.25, 0.25, 0.30)),
         ):
             for feature, value in zip(
                     ('force_margin', 'contact_fraction',
                      'safety_pressure', 'edge_clearance_norm',
-                     'level_pressure'),
+                     'level_pressure', 'steering_stability'),
                     vec):
                 self.declare_parameter(
                     f'bayesian_{prefix}_{feature}', float(value))
@@ -189,12 +185,28 @@ class SurfaceGoalPlanner(Node):
         self.declare_parameter('approach_axis_m', -2.0)
         self.declare_parameter('approach_theta_deg', -90.0)
         self.declare_parameter('approach_speed_mps', 0.12)
-        self.declare_parameter('axis_speed_mps', 0.08)
-        self.declare_parameter('curve_speed_mps', 0.14)
+        self.declare_parameter('axis_speed_mps', 0.25)
+        self.declare_parameter('curve_speed_mps', 0.25)
+        self.declare_parameter('max_surface_speed_mps', 0.25)
+        self.declare_parameter('guarded_speed_mps', 0.12)
+        self.declare_parameter('full_speed_contact_fraction', 0.85)
+        self.declare_parameter('full_speed_force_margin', 1.25)
+        self.declare_parameter('steering_change_penalty_enabled', True)
+        self.declare_parameter('steering_change_full_penalty_rad', 0.90)
+        self.declare_parameter('surface_cmd_smoothing_tau_s', 0.25)
+        self.declare_parameter('body_heading_rate_limit_enabled', True)
+        self.declare_parameter('body_heading_max_rate_rad_s', 0.80)
+        self.declare_parameter('body_heading_deadband_rad', 0.12)
+        self.declare_parameter('body_heading_min_speed_scale', 0.20)
+        self.declare_parameter('body_heading_min_speed_mps', 0.02)
+        self.declare_parameter('route_lookahead_m', 0.28)
+        self.declare_parameter('route_reacquire_backtrack_points', 3)
+        self.declare_parameter('goal_slowdown_distance_m', 0.80)
+        self.declare_parameter('goal_slowdown_min_scale', 0.18)
         self.declare_parameter('kp_axis', 0.6)
         self.declare_parameter('kp_theta', 0.9)
-        self.declare_parameter('angle_tolerance_deg', 4.0)
-        self.declare_parameter('axis_tolerance_m', 0.06)
+        self.declare_parameter('angle_tolerance_deg', 1.5)
+        self.declare_parameter('axis_tolerance_m', 0.025)
 
         gp = self.get_parameter
         self.world_frame = str(gp('world_frame').value)
@@ -265,6 +277,38 @@ class SurfaceGoalPlanner(Node):
         self.approach_speed = float(gp('approach_speed_mps').value)
         self.axis_speed = float(gp('axis_speed_mps').value)
         self.curve_speed = float(gp('curve_speed_mps').value)
+        self.max_surface_speed = max(
+            0.01, float(gp('max_surface_speed_mps').value))
+        self.guarded_speed = max(
+            0.01, float(gp('guarded_speed_mps').value))
+        self.full_speed_contact_fraction = _clamp(
+            float(gp('full_speed_contact_fraction').value), 0.05, 1.0)
+        self.full_speed_force_margin = max(
+            0.1, float(gp('full_speed_force_margin').value))
+        self.steering_change_penalty_enabled = bool(
+            gp('steering_change_penalty_enabled').value)
+        self.steering_change_full_penalty = max(
+            0.05, float(gp('steering_change_full_penalty_rad').value))
+        self.surface_cmd_smoothing_tau_s = max(
+            0.0, float(gp('surface_cmd_smoothing_tau_s').value))
+        self.body_heading_rate_limit_enabled = bool(
+            gp('body_heading_rate_limit_enabled').value)
+        self.body_heading_max_rate = max(
+            0.0, float(gp('body_heading_max_rate_rad_s').value))
+        self.body_heading_deadband = max(
+            0.0, float(gp('body_heading_deadband_rad').value))
+        self.body_heading_min_speed_scale = _clamp(
+            float(gp('body_heading_min_speed_scale').value), 0.0, 1.0)
+        self.body_heading_min_speed = max(
+            0.0, float(gp('body_heading_min_speed_mps').value))
+        self.route_lookahead_m = max(
+            0.02, float(gp('route_lookahead_m').value))
+        self.route_reacquire_backtrack_points = max(
+            0, int(gp('route_reacquire_backtrack_points').value))
+        self.goal_slowdown_distance = max(
+            0.0, float(gp('goal_slowdown_distance_m').value))
+        self.goal_slowdown_min_scale = _clamp(
+            float(gp('goal_slowdown_min_scale').value), 0.0, 1.0)
         self.kp_axis = float(gp('kp_axis').value)
         self.kp_theta = float(gp('kp_theta').value)
         self.angle_tol = math.radians(float(gp('angle_tolerance_deg').value))
@@ -294,8 +338,23 @@ class SurfaceGoalPlanner(Node):
         self.current_projection: Optional[SurfaceProjection] = None
         self.route_points: list = []
         self.route_index = 0
+        self.route_target_index = 0
         self.edge_clearance_m = float('inf')
         self.edge_motion_scale = 1.0
+        self.last_steering_cmd = None
+        self.steering_change_norm = 0.0
+        self.steering_change_rad = 0.0
+        self.smoothed_axis_cmd = 0.0
+        self.smoothed_curve_cmd = 0.0
+        self._last_surface_cmd_t = None
+        self.surface_speed_limit = self.max_surface_speed
+        self.last_body_heading = None
+        self._last_body_heading_t = None
+        self.body_heading_error_rad = 0.0
+        self.body_heading_speed_scale = 1.0
+        self.body_heading_limited = False
+        self.goal_distance_m = float('inf')
+        self.goal_slowdown_scale = 1.0
 
         self.attached = 0
         self.sum_force_n = 0.0
@@ -559,7 +618,7 @@ class SurfaceGoalPlanner(Node):
             for feature in (
                     'force_margin', 'contact_fraction',
                     'safety_pressure', 'edge_clearance_norm',
-                    'level_pressure'):
+                    'level_pressure', 'steering_stability'):
                 params[f'{tail}_{feature}'] = float(
                     gp(f'{prefix}_{feature}').value)
         return params
@@ -597,7 +656,7 @@ class SurfaceGoalPlanner(Node):
             response.message = 'Bayesian model reload failed; see node logs'
         return response
 
-    def _update_bayesian_model(self, projection):
+    def _update_bayesian_model(self, projection, steering_change_norm=0.0):
         """Run the Bayesian model on the current observation and store state.
 
         The model is the same one returned by ``BayesianMotionModel``;
@@ -620,6 +679,7 @@ class SurfaceGoalPlanner(Node):
             edge_clearance=float(self.edge_clearance_m),
             edge_margin=float(self.edge_margin),
             load_fraction=float(current_safety.get('load_fraction', 0.0)),
+            steering_change_norm=float(steering_change_norm),
         )
         decision = self.bayesian_model.decide(observation)
         # Optional low-pass filter on the posterior for extra smoothness.
@@ -638,8 +698,6 @@ class SurfaceGoalPlanner(Node):
         # Re-decide with the filtered posterior so the speed scale
         # matches the value shown in the debug topic.
         if self.bayesian_posterior_tau_s > 0.0:
-            filtered_decision = self.bayesian_model.update().decide(
-                observation)
             # Apply the smoothstep manually on the filtered posterior
             # so we don't recompute Gaussians needlessly.
             cfg = self.bayesian_model.config
@@ -870,10 +928,13 @@ class SurfaceGoalPlanner(Node):
                 self.target_projection.v,
                 self.target_projection.point)
         ]
+        self.route_index = 0
+        self.route_target_index = 0
 
     def _clear_route_and_goal(self, reason: str):
         self.route_points = []
         self.route_index = 0
+        self.route_target_index = 0
         self.target_projection = None
         self.goal_projection = None
         self.reached = False
@@ -937,6 +998,7 @@ class SurfaceGoalPlanner(Node):
     def _build_route(self):
         self.route_points = []
         self.route_index = 0
+        self.route_target_index = 0
         if self.target_projection is None:
             return
         pos = self._robot_position()
@@ -1032,6 +1094,8 @@ class SurfaceGoalPlanner(Node):
         if not self.route_points:
             if self.target_projection is None:
                 return None
+            self.route_index = 0
+            self.route_target_index = 0
             return RoutePoint(
                 self.target_projection.surface,
                 self.target_projection.u,
@@ -1039,12 +1103,53 @@ class SurfaceGoalPlanner(Node):
                 self.target_projection.point)
 
         self.route_index = min(self.route_index, len(self.route_points) - 1)
-        for index in range(self.route_index, len(self.route_points)):
+        search_start = max(
+            0, self.route_index - self.route_reacquire_backtrack_points)
+        closest_index = None
+        closest_distance = float('inf')
+        current_uv = (current.u, current.v)
+
+        for index in range(search_start, len(self.route_points)):
             point = self.route_points[index]
-            if point.surface.name == current.surface.name:
-                self.route_index = index
-                return point
-        return self.route_points[self.route_index]
+            if point.surface.name != current.surface.name:
+                continue
+            try:
+                distance = point.surface.distance_between(
+                    current_uv, (point.u, point.v))
+            except Exception:
+                continue
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_index = index
+
+        if closest_index is None:
+            self.route_target_index = self.route_index
+            return self.route_points[self.route_index]
+
+        self.route_index = max(self.route_index, closest_index)
+        target_index = self.route_index
+        lookahead = 0.0
+        if closest_distance > 0.0:
+            lookahead = closest_distance
+
+        while target_index < len(self.route_points) - 1:
+            current_point = self.route_points[target_index]
+            next_point = self.route_points[target_index + 1]
+            if next_point.surface.name != current.surface.name:
+                break
+            try:
+                segment = current_point.surface.distance_between(
+                    (current_point.u, current_point.v),
+                    (next_point.u, next_point.v))
+            except Exception:
+                break
+            if lookahead >= self.route_lookahead_m:
+                break
+            lookahead += segment
+            target_index += 1
+
+        self.route_target_index = target_index
+        return self.route_points[target_index]
 
     def _edge_motion_scale(self, base_position):
         if self.edge_margin <= 1e-9 or self.current_projection is None:
@@ -1083,6 +1188,166 @@ class SurfaceGoalPlanner(Node):
             return True
         age = (self.get_clock().now() - self.last_status_t).nanoseconds * 1e-9
         return age > self.status_timeout
+
+    @staticmethod
+    def _smoothstep01(value):
+        t = _clamp(value, 0.0, 1.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    def _mean_steering_change(self, desired):
+        if not self.steering_change_penalty_enabled:
+            return 0.0
+        if self.last_steering_cmd is None or not desired:
+            return 0.0
+        count = min(len(desired), len(self.last_steering_cmd))
+        if count <= 0:
+            return 0.0
+        return sum(
+            abs(_wrap_pi(desired[i] - self.last_steering_cmd[i]))
+            for i in range(count)) / count
+
+    def _remember_steering_cmd(self, body_x, body_y):
+        if math.hypot(body_x, body_y) <= 1e-4:
+            return
+        self.last_steering_cmd = self._steering_for_body_direction(
+            body_x, body_y)
+
+    def _surface_speed_limit_for_safety(self, safety):
+        limit = self.max_surface_speed
+        if not isinstance(safety, dict):
+            self.surface_speed_limit = limit
+            return limit
+
+        margin = safety.get('margin', float('inf'))
+        try:
+            force_margin = float(margin)
+        except (TypeError, ValueError):
+            force_margin = float('inf')
+        if not math.isfinite(force_margin):
+            force_scale = 1.0
+        else:
+            span = max(1e-6, self.full_speed_force_margin - 1.0)
+            force_scale = self._smoothstep01((force_margin - 1.0) / span)
+
+        try:
+            contact = float(safety.get(
+                'avg_contact_fraction', self.avg_contact_fraction))
+        except (TypeError, ValueError):
+            contact = self.avg_contact_fraction
+        contact_low = min(
+            self.min_side_contact_fraction,
+            self.full_speed_contact_fraction - 1e-3)
+        contact_span = max(
+            1e-6, self.full_speed_contact_fraction - contact_low)
+        contact_scale = self._smoothstep01((contact - contact_low) /
+                                           contact_span)
+
+        safety_scale = min(force_scale, contact_scale)
+        guarded_limit = min(self.guarded_speed, self.max_surface_speed)
+        limit = guarded_limit + (
+            self.max_surface_speed - guarded_limit) * safety_scale
+        self.surface_speed_limit = _clamp(
+            limit, guarded_limit, self.max_surface_speed)
+        return self.surface_speed_limit
+
+    def _smooth_surface_command(self, axis_cmd, curve_cmd):
+        now = self.get_clock().now()
+        if (self.surface_cmd_smoothing_tau_s <= 0.0 or
+                self._last_surface_cmd_t is None):
+            self.smoothed_axis_cmd = axis_cmd
+            self.smoothed_curve_cmd = curve_cmd
+            self._last_surface_cmd_t = now
+            return axis_cmd, curve_cmd
+
+        dt = (now - self._last_surface_cmd_t).nanoseconds * 1e-9
+        self._last_surface_cmd_t = now
+        tau = self.surface_cmd_smoothing_tau_s * (
+            1.0 + 1.5 * self.steering_change_norm)
+        alpha = 1.0 - math.exp(-max(0.0, dt) / max(1e-6, tau))
+        self.smoothed_axis_cmd = (
+            (1.0 - alpha) * self.smoothed_axis_cmd + alpha * axis_cmd)
+        self.smoothed_curve_cmd = (
+            (1.0 - alpha) * self.smoothed_curve_cmd + alpha * curve_cmd)
+        return self.smoothed_axis_cmd, self.smoothed_curve_cmd
+
+    @staticmethod
+    def _cap_surface_speed(axis_cmd, curve_cmd, speed_limit):
+        mag = math.hypot(axis_cmd, curve_cmd)
+        if mag <= speed_limit or mag <= 1e-9:
+            return axis_cmd, curve_cmd
+        scale = speed_limit / mag
+        return axis_cmd * scale, curve_cmd * scale
+
+    def _distance_to_goal(self, current: SurfaceProjection) -> float:
+        if self.target_projection is None:
+            return float('inf')
+        if current.surface.name == self.target_projection.surface.name:
+            return current.surface.distance_between(
+                (current.u, current.v),
+                (self.target_projection.u, self.target_projection.v))
+        if not self.route_points:
+            return float('inf')
+        start = min(self.route_index, len(self.route_points) - 1)
+        distance_left = 0.0
+        previous = RoutePoint(current.surface, current.u, current.v,
+                              current.point)
+        for point in self.route_points[start:]:
+            if point.surface.name != previous.surface.name:
+                previous = point
+                continue
+            distance_left += point.surface.distance_between(
+                (previous.u, previous.v), (point.u, point.v))
+            previous = point
+        return distance_left
+
+    def _goal_speed_scale(self, current: SurfaceProjection) -> float:
+        self.goal_distance_m = self._distance_to_goal(current)
+        if (self.goal_slowdown_distance <= 1e-9 or
+                not math.isfinite(self.goal_distance_m)):
+            self.goal_slowdown_scale = 1.0
+            return 1.0
+        t = _clamp(
+            self.goal_distance_m / self.goal_slowdown_distance,
+            0.0, 1.0)
+        smooth = self._smoothstep01(t)
+        self.goal_slowdown_scale = (
+            self.goal_slowdown_min_scale +
+            (1.0 - self.goal_slowdown_min_scale) * smooth)
+        return self.goal_slowdown_scale
+
+    def _limit_body_heading_change(self, body_x, body_y):
+        speed = math.hypot(body_x, body_y)
+        self.body_heading_limited = False
+        self.body_heading_speed_scale = 1.0
+        self.body_heading_error_rad = 0.0
+        if (not self.body_heading_rate_limit_enabled or
+                speed <= self.body_heading_min_speed):
+            return body_x, body_y
+
+        desired_heading = math.atan2(body_y, body_x)
+        now = self.get_clock().now()
+        if self._last_body_heading_t is None:
+            dt = 1.0 / max(1e-6, self.publish_hz)
+        else:
+            dt = (now - self._last_body_heading_t).nanoseconds * 1e-9
+        limited_heading, heading_error = rate_limited_heading(
+            self.last_body_heading,
+            desired_heading,
+            dt,
+            self.body_heading_max_rate,
+            self.body_heading_deadband)
+        self._last_body_heading_t = now
+        self.last_body_heading = limited_heading
+        self.body_heading_error_rad = abs(heading_error)
+        self.body_heading_limited = (
+            abs(_wrap_pi(limited_heading - desired_heading)) > 1e-6)
+        if self.body_heading_error_rad > self.body_heading_deadband:
+            self.body_heading_speed_scale = heading_alignment_scale(
+                heading_error, self.body_heading_min_speed_scale)
+        return (
+            speed * self.body_heading_speed_scale * math.cos(limited_heading),
+            speed * self.body_heading_speed_scale * math.sin(limited_heading),
+        )
 
     # ------------------------------------------------------------------
     # Main tick
@@ -1154,19 +1419,6 @@ class SurfaceGoalPlanner(Node):
                 f'unsafe target: {target_safety["reason"]}')
             return
 
-        # Update the Bayesian smooth motion model now that the
-        # classical safety gates have accepted the current pose.  The
-        # model can still veto the motion with ``emergency_hold`` (for
-        # catastrophic single-feature failures) and modulates the
-        # speed scale everywhere else via ``bayesian_speed_scale``.
-        self._update_bayesian_model(current_projection)
-        if (self.bayesian_replace_boundary_hold and
-                self.bayesian_emergency_hold):
-            self._publish_body_cmd(
-                0.0, 0.0, 0.0,
-                'bayesian emergency hold')
-            return
-
         route_target = self._route_target(current_projection)
         if route_target is None:
             self._publish_body_cmd(0.0, 0.0, 0.0, 'no route target')
@@ -1208,6 +1460,36 @@ class SurfaceGoalPlanner(Node):
             self.kp_theta * v_err * v_scale,
             -self.curve_speed, self.curve_speed)
         edge_scale = self._edge_motion_scale((rx, ry, rz))
+
+        raw_wx = axis_speed * tangent_u[0] + curve_speed * tangent_v[0]
+        raw_wy = axis_speed * tangent_u[1] + curve_speed * tangent_v[1]
+        raw_wz = axis_speed * tangent_u[2] + curve_speed * tangent_v[2]
+        raw_body = self._world_to_base(raw_wx, raw_wy, raw_wz)
+        if raw_body is None:
+            self._publish_body_cmd(0.0, 0.0, 0.0, 'no transform')
+            return
+        desired_steering = self._steering_for_body_direction(
+            raw_body[0], raw_body[1])
+        self.steering_change_rad = self._mean_steering_change(
+            desired_steering)
+        self.steering_change_norm = _clamp(
+            self.steering_change_rad / self.steering_change_full_penalty,
+            0.0, 1.0)
+
+        # Update the Bayesian smooth motion model now that the classical
+        # safety gates have accepted the current pose and the next steering
+        # request is known.  Steering stability becomes another observation:
+        # large wheel-angle changes reduce speed unless the route/surface
+        # still calls for them over multiple ticks.
+        self._update_bayesian_model(
+            current_projection, self.steering_change_norm)
+        if (self.bayesian_replace_boundary_hold and
+                self.bayesian_emergency_hold):
+            self._publish_body_cmd(
+                0.0, 0.0, 0.0,
+                'bayesian emergency hold')
+            return
+
         # The Bayesian model's smooth speed scaler modulates the
         # commanded velocity multiplicatively.  Multiplying by the
         # edge ramp preserves the per-feature safety semantics while
@@ -1215,14 +1497,27 @@ class SurfaceGoalPlanner(Node):
         bayes_scale = (
             self.bayesian_speed_scale if self.bayesian_speed_enabled
             and self.bayesian_model is not None else 1.0)
-        total_scale = edge_scale * bayes_scale
-        wx = total_scale * (
-            axis_speed * tangent_u[0] + curve_speed * tangent_v[0])
-        wy = total_scale * (
-            axis_speed * tangent_u[1] + curve_speed * tangent_v[1])
-        wz = total_scale * (
-            axis_speed * tangent_u[2] + curve_speed * tangent_v[2])
-        self._publish_world_cmd(wx, wy, wz, 'surface_graph')
+        goal_scale = self._goal_speed_scale(current_projection)
+        total_scale = edge_scale * bayes_scale * goal_scale
+        axis_cmd = total_scale * axis_speed
+        curve_cmd = total_scale * curve_speed
+        axis_cmd, curve_cmd = self._smooth_surface_command(
+            axis_cmd, curve_cmd)
+        axis_cmd, curve_cmd = self._cap_surface_speed(
+            axis_cmd, curve_cmd,
+            self._surface_speed_limit_for_safety(current_safety))
+        wx = axis_cmd * tangent_u[0] + curve_cmd * tangent_v[0]
+        wy = axis_cmd * tangent_u[1] + curve_cmd * tangent_v[1]
+        wz = axis_cmd * tangent_u[2] + curve_cmd * tangent_v[2]
+        body = self._world_to_base(wx, wy, wz)
+        if body is None:
+            self._publish_body_cmd(0.0, 0.0, 0.0, 'no transform')
+            return
+        limited_body_x, limited_body_y = self._limit_body_heading_change(
+            body[0], body[1])
+        self._remember_steering_cmd(limited_body_x, limited_body_y)
+        self._publish_body_cmd(limited_body_x, limited_body_y, 0.0,
+                               'surface_graph')
 
     def _goal_reached(self, current_projection, target_projection):
         if target_projection is None:
@@ -1420,6 +1715,13 @@ class SurfaceGoalPlanner(Node):
         zero_cmd = (
             abs(x) <= 1e-9 and abs(y) <= 1e-9 and abs(wz) <= 1e-9)
         if zero_cmd:
+            self.smoothed_axis_cmd = 0.0
+            self.smoothed_curve_cmd = 0.0
+            self._last_surface_cmd_t = None
+            self._last_body_heading_t = None
+            self.body_heading_error_rad = 0.0
+            self.body_heading_speed_scale = 1.0
+            self.body_heading_limited = False
             surface_hold = (
                 self.attached >= self.min_attached and
                 mode not in ('waiting for goal', 'no TF', 'no transform'))
@@ -1467,7 +1769,12 @@ class SurfaceGoalPlanner(Node):
             'wheel_steering_radius_m': self.wheel_steering_radius,
             'wheel_radius_m': self.wheel_radius,
             'route_index': self.route_index,
+            'route_target_index': self.route_target_index,
+            'route_lookahead_m': self.route_lookahead_m,
             'route_point_count': len(self.route_points),
+            'goal_distance_m': self.goal_distance_m,
+            'goal_slowdown_distance_m': self.goal_slowdown_distance,
+            'goal_slowdown_scale': self.goal_slowdown_scale,
             'route_algorithm': self.surface_graph.last_route.algorithm,
             'route_path': self.surface_graph.last_route.path,
             'route_cost': self.surface_graph.last_route.total_cost,
@@ -1487,6 +1794,22 @@ class SurfaceGoalPlanner(Node):
                 dict(self.bayesian_feature_log_likelihoods),
             'bayesian_log_likelihoods': dict(self.bayesian_log_likelihoods),
             'bayesian_posterior_tau_s': self.bayesian_posterior_tau_s,
+            'steering_change_rad': self.steering_change_rad,
+            'steering_change_norm': self.steering_change_norm,
+            'steering_change_penalty_enabled':
+                self.steering_change_penalty_enabled,
+            'surface_cmd_smoothing_tau_s': self.surface_cmd_smoothing_tau_s,
+            'surface_speed_limit_mps': self.surface_speed_limit,
+            'max_surface_speed_mps': self.max_surface_speed,
+            'full_speed_contact_fraction': self.full_speed_contact_fraction,
+            'full_speed_force_margin': self.full_speed_force_margin,
+            'body_heading_rate_limit_enabled':
+                self.body_heading_rate_limit_enabled,
+            'body_heading_limited': self.body_heading_limited,
+            'body_heading_error_rad': self.body_heading_error_rad,
+            'body_heading_speed_scale': self.body_heading_speed_scale,
+            'body_heading_max_rate_rad_s': self.body_heading_max_rate,
+            'body_heading_deadband_rad': self.body_heading_deadband,
             'cmd_body': [x, y, wz],
         })
         self.debug_pub.publish(dbg)
