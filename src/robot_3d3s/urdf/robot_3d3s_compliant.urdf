@@ -417,10 +417,14 @@
       <adhesion_model>gap_decay</adhesion_model>
       <force_n>900.0</force_n>
       <min_force_n>0.0</min_force_n>
+      <force_table_csv></force_table_csv>
+      <wall_thickness_mm>10.0</wall_thickness_mm>
+      <max_lookup_gap_mm>-1.0</max_lookup_gap_mm>
       <min_wall_force_n>350.0</min_wall_force_n>
       <gap_reference_mm>3.0</gap_reference_mm>
       <gap_bias_mm>0.0</gap_bias_mm>
       <wheel_radius_m>0.05</wheel_radius_m>
+      <wheel_width_m>0.05</wheel_width_m>
       <max_gap_m>0.06</max_gap_m>
       <full_contact_depth_m>0.002</full_contact_depth_m>
       <min_contact_fraction>0.10</min_contact_fraction>

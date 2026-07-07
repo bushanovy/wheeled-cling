@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -87,6 +88,12 @@ CallbackReturn SwerveController::on_init()
     auto_declare<double>("hold_steering_1", hold_position_1_);
     auto_declare<double>("hold_steering_2", hold_position_2_);
     auto_declare<double>("hold_steering_3", hold_position_3_);
+    auto_declare<bool>("prefer_reverse_over_steering", prefer_reverse_over_steering_);
+    auto_declare<double>("steering_flip_hysteresis_rad", steering_flip_hysteresis_rad_);
+    auto_declare<double>("max_steering_rate_rad_s", max_steering_rate_rad_s_);
+    auto_declare<double>("steering_command_deadband_rad", steering_command_deadband_rad_);
+    auto_declare<double>("steering_velocity_full_error_rad", steering_velocity_full_error_rad_);
+    auto_declare<double>("steering_velocity_stop_error_rad", steering_velocity_stop_error_rad_);
   }
   catch (const std::exception & e)
   {
@@ -115,7 +122,7 @@ InterfaceConfiguration SwerveController::state_interface_configuration() const
 }
 
 controller_interface::return_type SwerveController::update(
-  const rclcpp::Time & time, const rclcpp::Duration & /*period*/)
+  const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   auto logger = get_node()->get_logger();
 
@@ -182,6 +189,40 @@ controller_interface::return_type SwerveController::update(
     return std::abs(wrap_to_pi(a - b));
   };
 
+  auto rate_limit_steering = [&](double target, double previous) {
+    if (!std::isfinite(target)) {
+      return previous;
+    }
+    const double dt = period.seconds() > 0.0 ?
+      period.seconds() :
+      1.0 / 100.0;
+    const double max_step = max_steering_rate_rad_s_ > 0.0 ?
+      max_steering_rate_rad_s_ * dt :
+      std::numeric_limits<double>::infinity();
+    const double error = wrap_to_pi(target - previous);
+    if (std::abs(error) <= steering_command_deadband_rad_) {
+      return previous;
+    }
+    if (std::abs(error) <= max_step) {
+      return wrap_to_pi(target);
+    }
+    return wrap_to_pi(previous + std::copysign(max_step, error));
+  };
+
+  auto steering_alignment_scale = [&](double target, double actual) {
+    const double error = angular_distance(target, actual);
+    if (error <= steering_velocity_full_error_rad_) {
+      return 1.0;
+    }
+    if (error >= steering_velocity_stop_error_rad_) {
+      return 0.0;
+    }
+    const double span = std::max(
+      1.0e-9,
+      steering_velocity_stop_error_rad_ - steering_velocity_full_error_rad_);
+    return std::max(0.0, 1.0 - (error - steering_velocity_full_error_rad_) / span);
+  };
+
   double position_1 = last_position_1_;
   double position_2 = last_position_2_;
   double position_3 = last_position_3_;
@@ -236,8 +277,14 @@ controller_interface::return_type SwerveController::update(
 
     const bool flipped_within_limits =
       std::abs(flipped_pos) <= max_steering_position + 1.0e-9;
+    const double flipped_distance = angular_distance(flipped_pos, pos);
+    const double limited_distance = angular_distance(limited_pos, pos);
+    const bool reverse_is_near_equivalent =
+      prefer_reverse_over_steering_ &&
+      flipped_distance <= limited_distance + steering_flip_hysteresis_rad_;
+
     if (flipped_within_limits &&
-      angular_distance(flipped_pos, pos) < angular_distance(limited_pos, pos))
+      (flipped_distance < limited_distance || reverse_is_near_equivalent))
     {
       pos = flipped_pos;
       vel = flipped_vel;
@@ -252,6 +299,17 @@ controller_interface::return_type SwerveController::update(
   compute_wheel(alpha_1, position_1, velocity_1);
   compute_wheel(alpha_2, position_2, velocity_2);
   compute_wheel(alpha_3, position_3, velocity_3);
+
+  const double target_position_1 = position_1;
+  const double target_position_2 = position_2;
+  const double target_position_3 = position_3;
+
+  position_1 = rate_limit_steering(position_1, last_position_1_);
+  position_2 = rate_limit_steering(position_2, last_position_2_);
+  position_3 = rate_limit_steering(position_3, last_position_3_);
+  velocity_1 *= steering_alignment_scale(target_position_1, position_1);
+  velocity_2 *= steering_alignment_scale(target_position_2, position_2);
+  velocity_3 *= steering_alignment_scale(target_position_3, position_3);
 
   if (swerve_pub)
   {
@@ -338,6 +396,19 @@ CallbackReturn SwerveController::on_configure(const rclcpp_lifecycle::State &)
   hold_position_1_ = node->get_parameter("hold_steering_1").as_double();
   hold_position_2_ = node->get_parameter("hold_steering_2").as_double();
   hold_position_3_ = node->get_parameter("hold_steering_3").as_double();
+  prefer_reverse_over_steering_ =
+    node->get_parameter("prefer_reverse_over_steering").as_bool();
+  steering_flip_hysteresis_rad_ = std::max(
+    0.0, node->get_parameter("steering_flip_hysteresis_rad").as_double());
+  max_steering_rate_rad_s_ = std::max(
+    0.0, node->get_parameter("max_steering_rate_rad_s").as_double());
+  steering_command_deadband_rad_ = std::max(
+    0.0, node->get_parameter("steering_command_deadband_rad").as_double());
+  steering_velocity_full_error_rad_ = std::max(
+    0.0, node->get_parameter("steering_velocity_full_error_rad").as_double());
+  steering_velocity_stop_error_rad_ = std::max(
+    steering_velocity_full_error_rad_,
+    node->get_parameter("steering_velocity_stop_error_rad").as_double());
 
   swerve_pub = node->create_publisher<std_msgs::msg::Float64MultiArray>("~/swerve_cmd", 10);
 

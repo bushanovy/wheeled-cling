@@ -2,8 +2,12 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <fstream>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <gz/common/Console.hh>
@@ -41,10 +45,16 @@ class Kmw100AdhesionSystem:
     this->adhesionModel = this->Param(_sdf, "adhesion_model", this->adhesionModel);
     this->forceN = this->Param(_sdf, "force_n", this->forceN);
     this->minForceN = this->Param(_sdf, "min_force_n", this->minForceN);
+    this->forceTableCsv = this->Param(_sdf, "force_table_csv", this->forceTableCsv);
+    this->wallThicknessMm =
+        this->Param(_sdf, "wall_thickness_mm", this->wallThicknessMm);
+    this->maxLookupGapMm =
+        this->Param(_sdf, "max_lookup_gap_mm", this->maxLookupGapMm);
     this->gapReferenceMm =
         this->Param(_sdf, "gap_reference_mm", this->gapReferenceMm);
     this->gapBiasMm = this->Param(_sdf, "gap_bias_mm", this->gapBiasMm);
     this->wheelRadiusM = this->Param(_sdf, "wheel_radius_m", this->wheelRadiusM);
+    this->wheelWidthM = this->Param(_sdf, "wheel_width_m", this->wheelWidthM);
     this->maxGapM = this->Param(_sdf, "max_gap_m", this->maxGapM);
     this->minWallForceN = this->Param(_sdf, "min_wall_force_n", this->minWallForceN);
     this->fullContactDepthM =
@@ -83,6 +93,17 @@ class Kmw100AdhesionSystem:
     this->statusPeriodS = this->Param(_sdf, "status_period_s", this->statusPeriodS);
     this->statusTopic = this->Param(_sdf, "status_topic", this->statusTopic);
 
+    if (this->adhesionModel == "lookup")
+    {
+      if (this->forceTableCsv.empty() || !this->LoadForceTable(this->forceTableCsv))
+      {
+        gzerr << "Kmw100AdhesionSystem could not load lookup table ["
+              << this->forceTableCsv
+              << "]; falling back to gap_decay.\n";
+        this->adhesionModel = "gap_decay";
+      }
+    }
+
     this->wheelLinks.clear();
     for (const auto &name : this->wheelNames)
     {
@@ -119,7 +140,8 @@ class Kmw100AdhesionSystem:
           << " N, wall_force_min=" << this->minWallForceN
           << " N, max_gap=" << this->maxGapM
           << " m, both_wall_faces=" << (this->enableOppositeWall ? "true" : "false")
-          << " m, status_topic=" << this->statusTopic
+          << ", table_rows=" << this->forceTable.size()
+          << ", status_topic=" << this->statusTopic
           << ". gap_decay follows F=F0/(1+s^3) with s=gap_mm/gap_reference_mm.\n";
   }
 
@@ -193,7 +215,15 @@ class Kmw100AdhesionSystem:
             p.Z() >= slideTopZ - 3.0 * this->surfaceMarginM);
       }
 
-      this->ConsiderPipeSurface(candidates, p);
+      // The wheel spins about its joint axis, which is X in the wheel link frame
+      // (URDF wheel_*_joint axis="1 0 0"). A seated wheel has this axle parallel
+      // to the surface, so tilt = asin(|axle . normal|) is ~0 when seated on ANY
+      // surface (ground/slide/wall). Using local Z here made the ground/slide
+      // tilt read ~50-80 deg and clamp adhesion to the floor.
+      const auto wheelAxis = poseOpt->Rot().RotateVector(
+          gz::math::Vector3d(1.0, 0.0, 0.0));
+
+      this->ConsiderPipeSurface(candidates, p, wheelAxis);
 
       if (candidates.empty())
       {
@@ -208,13 +238,6 @@ class Kmw100AdhesionSystem:
           });
 
       const double bestScore = candidates.front().score;
-      // The wheel spins about its joint axis, which is X in the wheel link frame
-      // (URDF wheel_*_joint axis="1 0 0"). A seated wheel has this axle parallel
-      // to the surface, so tilt = asin(|axle . normal|) is ~0 when seated on ANY
-      // surface (ground/slide/wall). Using local Z here made the ground/slide
-      // tilt read ~50-80 deg and clamp adhesion to the floor.
-      const auto wheelAxis = poseOpt->Rot().RotateVector(
-          gz::math::Vector3d(1.0, 0.0, 0.0));
       gz::math::Vector3d totalForce(0.0, 0.0, 0.0);
       double totalForceN = 0.0;
       std::string surfaceNames;
@@ -222,7 +245,7 @@ class Kmw100AdhesionSystem:
 
       for (auto surface : candidates)
       {
-        if (surface.gapM > this->maxGapM ||
+        if (surface.forceGapM > this->maxGapM ||
             surface.score > bestScore + this->cornerCaptureM)
         {
           continue;
@@ -232,7 +255,7 @@ class Kmw100AdhesionSystem:
             candidates.begin(), candidates.end(),
             [&](const Surface &_surface)
             {
-              return _surface.gapM <= this->maxGapM &&
+              return _surface.forceGapM <= this->maxGapM &&
                   _surface.score <= bestScore + this->cornerCaptureM;
             }));
         multiSurface = activeCount > 1;
@@ -242,7 +265,7 @@ class Kmw100AdhesionSystem:
 
         const double tiltDeg = this->TiltDeg(wheelAxis, -surface.normal);
         double force = this->AdhesionForceN(
-            surface.gapM, surface.contactFraction, tiltDeg);
+            surface.forceGapM, surface.contactFraction, tiltDeg);
         if (surface.statusName == "wall")
           force = std::max(force, this->minWallForceN * surface.contactFraction);
 
@@ -256,7 +279,9 @@ class Kmw100AdhesionSystem:
 
         debugParts.push_back(
             this->wheelNames[i] + "=" + surface.name +
-            ",gap=" + std::to_string(surface.gapM * 1000.0) +
+            ",gap=" + std::to_string(surface.forceGapM * 1000.0) +
+            "mm,radial_gap=" + std::to_string(surface.gapM * 1000.0) +
+            "mm,curv_gap=" + std::to_string(surface.curvatureGapM * 1000.0) +
             "mm,cf=" + std::to_string(surface.contactFraction) +
             ",tilt=" + std::to_string(tiltDeg) +
             "deg,F=(" + std::to_string(forceVec.X()) + "," +
@@ -273,7 +298,9 @@ class Kmw100AdhesionSystem:
       this->wheelLinks[i].AddWorldForce(_ecm, totalForce);
 
       status.surface = surfaceNames;
-      status.gapM = candidates.front().gapM;
+      status.gapM = candidates.front().forceGapM;
+      status.radialGapM = candidates.front().gapM;
+      status.curvatureGapM = candidates.front().curvatureGapM;
       status.normal = totalForce.Normalized();
       status.attached = true;
       status.forceN = totalForceN;
@@ -341,6 +368,8 @@ class Kmw100AdhesionSystem:
     std::string statusName;
     gz::math::Vector3d normal{1.0, 0.0, 0.0};
     double gapM{0.0};
+    double forceGapM{0.0};
+    double curvatureGapM{0.0};
     double score{1e9};
     double contactFraction{1.0};
   };
@@ -351,6 +380,8 @@ class Kmw100AdhesionSystem:
     std::string surface{"none"};
     bool attached{false};
     double gapM{0.0};
+    double radialGapM{0.0};
+    double curvatureGapM{0.0};
     double forceN{0.0};
     double contactFraction{0.0};
     gz::math::Vector3d normal{0.0, 0.0, 0.0};
@@ -379,6 +410,7 @@ class Kmw100AdhesionSystem:
     surface.statusName = _statusName;
     surface.normal = _normal.Normalized();
     surface.gapM = gap;
+    surface.forceGapM = gap;
     surface.score = score;
     surface.contactFraction = this->ContactFraction(score, gap);
     _candidates.push_back(surface);
@@ -386,7 +418,8 @@ class Kmw100AdhesionSystem:
 
   private: void ConsiderPipeSurface(
       std::vector<Surface> &_candidates,
-      const gz::math::Vector3d &_wheelPos) const
+      const gz::math::Vector3d &_wheelPos,
+      const gz::math::Vector3d &_wheelAxis) const
   {
     if (!this->enablePipe || this->pipeRadiusM <= 0.0)
       return;
@@ -411,10 +444,45 @@ class Kmw100AdhesionSystem:
       return;
 
     const gz::math::Vector3d normal = radial / radialLen;
-    const gz::math::Vector3d surfacePoint = center + axis * axial + normal * this->pipeRadiusM;
-    this->ConsiderSurface(
-        _candidates, "pipe_" + lowerAxis, "pipe",
-        normal, surfacePoint, _wheelPos, true);
+    const double signedCenterGap = radialLen - this->pipeRadiusM;
+    const double radialGap = std::max(0.0, signedCenterGap - this->wheelRadiusM);
+    const double radialScore = std::abs(signedCenterGap - this->wheelRadiusM);
+
+    const double axisAlignment = this->AxisAlignment(_wheelAxis, axis);
+    const double circumferentialSpan =
+        0.5 * this->wheelWidthM *
+        std::sqrt(std::max(0.0, 1.0 - axisAlignment * axisAlignment));
+    double curvatureGap = 0.0;
+    if (circumferentialSpan > 0.0 && circumferentialSpan < this->pipeRadiusM)
+    {
+      curvatureGap = this->pipeRadiusM -
+          std::sqrt(std::max(
+              0.0,
+              this->pipeRadiusM * this->pipeRadiusM -
+              circumferentialSpan * circumferentialSpan));
+    }
+    else if (circumferentialSpan >= this->pipeRadiusM)
+    {
+      curvatureGap = this->maxGapM + this->surfaceMarginM;
+    }
+
+    const double forceGap = radialGap + curvatureGap;
+    const double score = radialScore + curvatureGap;
+    if (score > this->surfaceMarginM + this->maxGapM)
+      return;
+
+    Surface surface;
+    surface.name = "pipe_" + lowerAxis;
+    surface.statusName = "pipe";
+    surface.normal = normal;
+    surface.gapM = radialGap;
+    surface.forceGapM = forceGap;
+    surface.curvatureGapM = curvatureGap;
+    surface.score = score;
+    surface.contactFraction =
+        this->ContactFraction(radialScore, radialGap) *
+        this->ContactFraction(curvatureGap, curvatureGap);
+    _candidates.push_back(surface);
   }
 
   private: double ContactFraction(const double _score, const double _gap) const
@@ -435,6 +503,199 @@ class Kmw100AdhesionSystem:
     const double gapMm = std::max(0.0, _gapM * 1000.0 + this->gapBiasMm);
     const double s = gapMm / this->gapReferenceMm;
     return 1.0 / (1.0 + s * s * s);
+  }
+
+  private: double AxisAlignment(
+      const gz::math::Vector3d &_a,
+      const gz::math::Vector3d &_b) const
+  {
+    const double aLen = _a.Length();
+    const double bLen = _b.Length();
+    if (aLen <= 1e-9 || bLen <= 1e-9)
+      return 1.0;
+    return std::abs(_a.Dot(_b) / (aLen * bLen));
+  }
+
+  private: struct ForceKey
+  {
+    double gapMm{0.0};
+    double thicknessMm{0.0};
+    double pipeRadiusM{0.0};
+    double contactFraction{1.0};
+
+    bool operator<(const ForceKey &_other) const
+    {
+      return std::tie(
+          this->gapMm, this->thicknessMm,
+          this->pipeRadiusM, this->contactFraction) <
+          std::tie(
+              _other.gapMm, _other.thicknessMm,
+              _other.pipeRadiusM, _other.contactFraction);
+    }
+  };
+
+  private: static std::string Trim(const std::string &_value)
+  {
+    const auto begin = std::find_if_not(_value.begin(), _value.end(),
+        [](unsigned char c){ return std::isspace(c); });
+    const auto end = std::find_if_not(_value.rbegin(), _value.rend(),
+        [](unsigned char c){ return std::isspace(c); }).base();
+    if (begin >= end)
+      return "";
+    return std::string(begin, end);
+  }
+
+  private: static std::vector<std::string> SplitCsvLine(const std::string &_line)
+  {
+    std::vector<std::string> fields;
+    std::stringstream stream(_line);
+    std::string field;
+    while (std::getline(stream, field, ','))
+      fields.push_back(Trim(field));
+    return fields;
+  }
+
+  private: static bool HasColumn(
+      const std::map<std::string, std::size_t> &_columns,
+      const std::string &_name)
+  {
+    return _columns.find(_name) != _columns.end();
+  }
+
+  private: static double CsvDouble(
+      const std::vector<std::string> &_row,
+      const std::map<std::string, std::size_t> &_columns,
+      const std::string &_name,
+      const double _defaultValue)
+  {
+    const auto it = _columns.find(_name);
+    if (it == _columns.end() || it->second >= _row.size() || _row[it->second].empty())
+      return _defaultValue;
+    return std::stod(_row[it->second]);
+  }
+
+  private: bool LoadForceTable(const std::string &_path)
+  {
+    std::ifstream file(_path);
+    if (!file)
+      return false;
+
+    std::string line;
+    if (!std::getline(file, line))
+      return false;
+
+    const auto headers = SplitCsvLine(line);
+    std::map<std::string, std::size_t> columns;
+    for (std::size_t i = 0; i < headers.size(); ++i)
+      columns[headers[i]] = i;
+
+    if (!HasColumn(columns, "gap_mm") || !HasColumn(columns, "force_n") ||
+        (!HasColumn(columns, "thickness_mm") &&
+         !HasColumn(columns, "wall_thickness_mm")))
+    {
+      gzerr << "Kmw100AdhesionSystem lookup CSV [" << _path
+            << "] needs gap_mm, force_n, and thickness_mm or wall_thickness_mm.\n";
+      return false;
+    }
+
+    this->hasPipeRadiusAxis = HasColumn(columns, "pipe_radius_m");
+    this->hasContactFractionAxis = HasColumn(columns, "contact_fraction");
+    this->forceTable.clear();
+    this->gapAxisMm.clear();
+    this->thicknessAxisMm.clear();
+    this->pipeRadiusAxisM.clear();
+    this->contactFractionAxis.clear();
+
+    std::set<double> gaps;
+    std::set<double> thicknesses;
+    std::set<double> radii;
+    std::set<double> contacts;
+    while (std::getline(file, line))
+    {
+      if (Trim(line).empty())
+        continue;
+      const auto row = SplitCsvLine(line);
+      const double gapMm = CsvDouble(row, columns, "gap_mm", 0.0);
+      const double thicknessMm = HasColumn(columns, "wall_thickness_mm") ?
+          CsvDouble(row, columns, "wall_thickness_mm", 0.0) :
+          CsvDouble(row, columns, "thickness_mm", 0.0);
+      const double pipeRadiusM = CsvDouble(row, columns, "pipe_radius_m", 0.0);
+      const double contactFraction =
+          CsvDouble(row, columns, "contact_fraction", 1.0);
+      const double forceN = CsvDouble(row, columns, "force_n", 0.0);
+      gaps.insert(gapMm);
+      thicknesses.insert(thicknessMm);
+      radii.insert(pipeRadiusM);
+      contacts.insert(contactFraction);
+      this->forceTable[{gapMm, thicknessMm, pipeRadiusM, contactFraction}] = forceN;
+    }
+
+    this->gapAxisMm.assign(gaps.begin(), gaps.end());
+    this->thicknessAxisMm.assign(thicknesses.begin(), thicknesses.end());
+    this->pipeRadiusAxisM.assign(radii.begin(), radii.end());
+    this->contactFractionAxis.assign(contacts.begin(), contacts.end());
+    return !this->forceTable.empty();
+  }
+
+  private: static std::tuple<double, double, double> Bounds(
+      const std::vector<double> &_axis,
+      const double _query)
+  {
+    if (_axis.empty())
+      return {0.0, 0.0, 0.0};
+    if (_query <= _axis.front())
+      return {_axis.front(), _axis.front(), 0.0};
+    if (_query >= _axis.back())
+      return {_axis.back(), _axis.back(), 0.0};
+    for (std::size_t i = 0; i + 1 < _axis.size(); ++i)
+    {
+      if (_axis[i] <= _query && _query <= _axis[i + 1])
+      {
+        const double ratio = (_query - _axis[i]) / (_axis[i + 1] - _axis[i]);
+        return {_axis[i], _axis[i + 1], ratio};
+      }
+    }
+    return {_axis.back(), _axis.back(), 0.0};
+  }
+
+  private: double LookupForceN(
+      const double _gapMm,
+      const double _contactFraction) const
+  {
+    const auto [g0, g1, gr] = Bounds(this->gapAxisMm, _gapMm);
+    const auto [t0, t1, tr] = Bounds(this->thicknessAxisMm, this->wallThicknessMm);
+    const auto [r0, r1, rr] = Bounds(this->pipeRadiusAxisM, this->pipeRadiusM);
+    const auto [c0, c1, cr] =
+        Bounds(this->contactFractionAxis, _contactFraction);
+
+    double total = 0.0;
+    for (int gi = 0; gi < 2; ++gi)
+    {
+      const double gv = gi == 0 ? g0 : g1;
+      const double gw = gi == 0 ? 1.0 - gr : gr;
+      for (int ti = 0; ti < 2; ++ti)
+      {
+        const double tv = ti == 0 ? t0 : t1;
+        const double tw = ti == 0 ? 1.0 - tr : tr;
+        for (int ri = 0; ri < 2; ++ri)
+        {
+          const double rv = ri == 0 ? r0 : r1;
+          const double rw = ri == 0 ? 1.0 - rr : rr;
+          for (int ci = 0; ci < 2; ++ci)
+          {
+            const double cv = ci == 0 ? c0 : c1;
+            const double cw = ci == 0 ? 1.0 - cr : cr;
+            const auto it = this->forceTable.find({gv, tv, rv, cv});
+            if (it != this->forceTable.end())
+              total += it->second * gw * tw * rw * cw;
+          }
+        }
+      }
+    }
+
+    if (!this->hasContactFractionAxis)
+      total *= _contactFraction;
+    return total;
   }
 
   private: double TiltDeg(
@@ -481,10 +742,21 @@ class Kmw100AdhesionSystem:
       const double _contactFraction,
       const double _tiltDeg) const
   {
+    const double contactFraction = std::max(0.0, std::min(1.0, _contactFraction));
     double force = this->forceN;
-    if (this->adhesionModel == "gap_decay")
-      force *= this->GapDecayScale(_gapM);
-    force *= std::max(0.0, std::min(1.0, _contactFraction));
+    if (this->adhesionModel == "lookup" && !this->forceTable.empty())
+    {
+      double gapMm = std::max(0.0, _gapM * 1000.0 + this->gapBiasMm);
+      if (this->maxLookupGapMm >= 0.0)
+        gapMm = std::min(gapMm, this->maxLookupGapMm);
+      force = this->LookupForceN(gapMm, contactFraction);
+    }
+    else
+    {
+      if (this->adhesionModel == "gap_decay")
+        force *= this->GapDecayScale(_gapM);
+      force *= contactFraction;
+    }
     force *= this->TiltScale(_tiltDeg);
     return std::max(force, this->minForceN);
   }
@@ -543,6 +815,12 @@ class Kmw100AdhesionSystem:
         << ",\"pipe_count\":" << pipeCount
         << ",\"boundary_risk\":0.0"
         << ",\"boundary_state\":\"ok\""
+        << ",\"adhesion_model\":\"" << this->adhesionModel << "\""
+        << ",\"force_nominal_n\":" << this->forceN
+        << ",\"min_force_n\":" << this->minForceN
+        << ",\"max_gap_mm\":" << (this->maxGapM * 1000.0)
+        << ",\"gap_reference_mm\":" << this->gapReferenceMm
+        << ",\"pipe_radius_m\":" << this->pipeRadiusM
         << ",\"wheels\":[";
 
     for (std::size_t i = 0; i < _statuses.size(); ++i)
@@ -554,6 +832,9 @@ class Kmw100AdhesionSystem:
           << "\",\"surface\":\"" << status.surface
           << "\",\"attached\":" << (status.attached ? "true" : "false")
           << ",\"gap_mm\":" << (status.gapM * 1000.0)
+          << ",\"effective_gap_mm\":" << (status.gapM * 1000.0)
+          << ",\"radial_gap_mm\":" << (status.radialGapM * 1000.0)
+          << ",\"curvature_gap_mm\":" << (status.curvatureGapM * 1000.0)
           << ",\"force_n\":" << status.forceN
           << ",\"contact_fraction\":" << status.contactFraction
           << ",\"normal\":[" << status.normal.X()
@@ -588,9 +869,13 @@ class Kmw100AdhesionSystem:
   private: double forceN{900.0};
   private: double minForceN{0.0};
   private: double minWallForceN{350.0};
+  private: std::string forceTableCsv{""};
+  private: double wallThicknessMm{10.0};
+  private: double maxLookupGapMm{-1.0};
   private: double gapReferenceMm{3.0};
   private: double gapBiasMm{0.0};
   private: double wheelRadiusM{0.05};
+  private: double wheelWidthM{0.05};
   private: double maxGapM{0.06};
   private: double fullContactDepthM{0.002};
   private: double minContactFraction{0.10};
@@ -625,6 +910,13 @@ class Kmw100AdhesionSystem:
   private: std::chrono::steady_clock::duration nextStatusTime{0};
   private: gz::transport::Node transportNode;
   private: gz::transport::Node::Publisher statusPub;
+  private: std::map<ForceKey, double> forceTable;
+  private: std::vector<double> gapAxisMm;
+  private: std::vector<double> thicknessAxisMm;
+  private: std::vector<double> pipeRadiusAxisM;
+  private: std::vector<double> contactFractionAxis;
+  private: bool hasPipeRadiusAxis{false};
+  private: bool hasContactFractionAxis{false};
 
   private: static std::string Lower(std::string value)
   {

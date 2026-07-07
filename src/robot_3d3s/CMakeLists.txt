@@ -48,6 +48,7 @@ install(PROGRAMS
   scripts/magnetic_adhesion.py
   scripts/climb_scene_rviz.py
   scripts/adhesion_report.py
+  scripts/adhesion_gap_sweep.py
   scripts/climb_goal_controller.py
   scripts/surface_keepout_publisher.py
   scripts/wheel_tf_debug.py
@@ -68,6 +69,7 @@ install(PROGRAMS
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_surface_geometry test/test_surface_geometry.py)
+  ament_add_pytest_test(test_adhesion_gap_sweep test/test_adhesion_gap_sweep.py)
 endif()
 
 ament_package()

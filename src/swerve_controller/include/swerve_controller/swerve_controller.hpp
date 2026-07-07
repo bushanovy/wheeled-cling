@@ -140,6 +140,12 @@ protected:
   double hold_position_1_ = 0.0;
   double hold_position_2_ = 0.0;
   double hold_position_3_ = 0.0;
+  bool prefer_reverse_over_steering_ = true;
+  double steering_flip_hysteresis_rad_ = 0.08;
+  double max_steering_rate_rad_s_ = 1.2;
+  double steering_command_deadband_rad_ = 0.002;
+  double steering_velocity_full_error_rad_ = 0.08;
+  double steering_velocity_stop_error_rad_ = 0.45;
 
   bool reset();
   void halt();

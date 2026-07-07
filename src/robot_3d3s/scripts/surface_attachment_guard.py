@@ -52,6 +52,7 @@ class SurfaceAttachmentGuard(Node):
         self.declare_parameter('latch_timeout_s', 3.0)
         self.declare_parameter('startup_hold_s', 0.0)
         self.declare_parameter('startup_hold_theta_deg', 0.0)
+        self.declare_parameter('surface_heading_offset_deg', 0.0)
         self.declare_parameter('align_orientation', True)
         self.declare_parameter('orientation_tolerance_deg', 2.0)
         self.declare_parameter('status_timeout_s', 0.7)
@@ -104,6 +105,8 @@ class SurfaceAttachmentGuard(Node):
         self.startup_hold_s = max(0.0, float(gp('startup_hold_s').value))
         self.startup_hold_theta = math.radians(
             float(gp('startup_hold_theta_deg').value))
+        self.surface_heading_offset = math.radians(
+            float(gp('surface_heading_offset_deg').value))
         self.align_orientation = bool(gp('align_orientation').value)
         self.orientation_tolerance = math.radians(max(
             0.0, float(gp('orientation_tolerance_deg').value)))
@@ -474,6 +477,21 @@ class SurfaceAttachmentGuard(Node):
         y_axis = self._normalize(*y_axis)
         if y_axis is None:
             return None
+        if abs(self.surface_heading_offset) > 1e-9:
+            c = math.cos(self.surface_heading_offset)
+            s = math.sin(self.surface_heading_offset)
+            x_axis, y_axis = (
+                (
+                    c * x_axis[0] + s * y_axis[0],
+                    c * x_axis[1] + s * y_axis[1],
+                    c * x_axis[2] + s * y_axis[2],
+                ),
+                (
+                    -s * x_axis[0] + c * y_axis[0],
+                    -s * x_axis[1] + c * y_axis[1],
+                    -s * x_axis[2] + c * y_axis[2],
+                ),
+            )
         return self._quat_from_basis(x_axis, y_axis, z_axis)
 
     @staticmethod

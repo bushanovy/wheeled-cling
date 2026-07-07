@@ -25,4 +25,10 @@ swerve_controller:
     hold_steering_1: 0.0
     hold_steering_2: 0.0
     hold_steering_3: 0.0
+    prefer_reverse_over_steering: true
+    steering_flip_hysteresis_rad: 0.08
+    max_steering_rate_rad_s: 1.2
+    steering_command_deadband_rad: 0.002
+    steering_velocity_full_error_rad: 0.08
+    steering_velocity_stop_error_rad: 0.45
     

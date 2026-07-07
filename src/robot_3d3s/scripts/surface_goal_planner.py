@@ -207,6 +207,8 @@ class SurfaceGoalPlanner(Node):
         self.declare_parameter('kp_theta', 0.9)
         self.declare_parameter('angle_tolerance_deg', 1.5)
         self.declare_parameter('axis_tolerance_m', 0.025)
+        self.declare_parameter('goal_hold_steering_strategy', 'max_adhesion')
+        self.declare_parameter('goal_hold_publish_steering', True)
 
         gp = self.get_parameter
         self.world_frame = str(gp('world_frame').value)
@@ -313,6 +315,16 @@ class SurfaceGoalPlanner(Node):
         self.kp_theta = float(gp('kp_theta').value)
         self.angle_tol = math.radians(float(gp('angle_tolerance_deg').value))
         self.axis_tol = float(gp('axis_tolerance_m').value)
+        self.goal_hold_steering_strategy = str(
+            gp('goal_hold_steering_strategy').value).lower()
+        if self.goal_hold_steering_strategy not in (
+                'max_adhesion', 'least_vertical', 'current'):
+            self.get_logger().warn(
+                'Unsupported goal_hold_steering_strategy='
+                f'{self.goal_hold_steering_strategy}; using max_adhesion.')
+            self.goal_hold_steering_strategy = 'max_adhesion'
+        self.goal_hold_publish_steering = bool(
+            gp('goal_hold_publish_steering').value)
 
         # ---- Bayesian smooth motion model --------------------------------
         self.bayesian_speed_enabled = bool(
@@ -342,6 +354,7 @@ class SurfaceGoalPlanner(Node):
         self.edge_clearance_m = float('inf')
         self.edge_motion_scale = 1.0
         self.last_steering_cmd = None
+        self.last_hold_steering_cmd = [0.0, 0.0, 0.0]
         self.steering_change_norm = 0.0
         self.steering_change_rad = 0.0
         self.smoothed_axis_cmd = 0.0
@@ -1183,6 +1196,19 @@ class SurfaceGoalPlanner(Node):
         q = tf.transform.rotation
         return _quat_rotate(q.x, q.y, q.z, q.w, vx, vy, vz)
 
+    def _base_to_world(self, vx, vy, vz):
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.world_frame, self.base_frame, Time(),
+                timeout=Duration(seconds=self.tf_timeout))
+        except TransformException as exc:
+            self.get_logger().warn(
+                f'Cannot transform {self.base_frame}->{self.world_frame}: {exc}',
+                throttle_duration_sec=2.0)
+            return None
+        q = tf.transform.rotation
+        return _quat_rotate(q.x, q.y, q.z, q.w, vx, vy, vz)
+
     def _status_stale(self):
         if self.last_status_t is None:
             return True
@@ -1675,6 +1701,8 @@ class SurfaceGoalPlanner(Node):
         return out
 
     def _publish_hold_steering(self, surface_hold):
+        if not self.goal_hold_publish_steering:
+            return
         msg = Float64MultiArray()
         if surface_hold:
             body = self._world_to_base(*self._parking_direction())
@@ -1682,15 +1710,27 @@ class SurfaceGoalPlanner(Node):
                 msg.data = self._steering_for_body_direction(
                     body[0], body[1])
             else:
-                msg.data = [0.0, 0.0, 0.0]
+                msg.data = self.last_hold_steering_cmd
         else:
             msg.data = [0.0, 0.0, 0.0]
+        self.last_hold_steering_cmd = list(msg.data)
         self.hold_steering_pub.publish(msg)
 
     def _parking_direction(self):
         if self.current_projection is not None:
             tangent_u = self.current_projection.tangent_u
             tangent_v = self.current_projection.tangent_v
+            if self.goal_hold_steering_strategy == 'current':
+                if self.last_steering_cmd:
+                    return self._body_to_world_direction_from_steering(
+                        self.last_steering_cmd[0])
+                return tangent_u
+            if (self.goal_hold_steering_strategy == 'max_adhesion' and
+                    isinstance(self.current_projection.surface, CylinderSurface)):
+                # Rolling circumferentially parks the wheel axles along the
+                # pipe axis, which minimizes the curvature gap used by the
+                # adhesion model while the wheel velocity is zero.
+                return tangent_v
             if abs(tangent_v[2]) < abs(tangent_u[2]):
                 return tangent_v
             return tangent_u
@@ -1710,6 +1750,16 @@ class SurfaceGoalPlanner(Node):
         if abs(tangent[2]) < abs(axis_dir[2]):
             return tangent
         return axis_dir
+
+    def _body_to_world_direction_from_steering(self, steering_angle):
+        # Approximate the rolling direction for wheel 1.  This is only used for
+        # the optional "current" hold strategy to avoid changing hold steering.
+        body_x = math.cos(math.pi / 2.0 - steering_angle)
+        body_y = math.sin(math.pi / 2.0 - steering_angle)
+        world = self._base_to_world(body_x, body_y, 0.0)
+        if world is None:
+            return (body_x, body_y, 0.0)
+        return world
 
     def _publish_body_cmd(self, x, y, wz, mode):
         zero_cmd = (
@@ -1775,6 +1825,8 @@ class SurfaceGoalPlanner(Node):
             'goal_distance_m': self.goal_distance_m,
             'goal_slowdown_distance_m': self.goal_slowdown_distance,
             'goal_slowdown_scale': self.goal_slowdown_scale,
+            'goal_hold_steering_strategy': self.goal_hold_steering_strategy,
+            'goal_hold_publish_steering': self.goal_hold_publish_steering,
             'route_algorithm': self.surface_graph.last_route.algorithm,
             'route_path': self.surface_graph.last_route.path,
             'route_cost': self.surface_graph.last_route.total_cost,

@@ -67,15 +67,17 @@ SCENARIOS = {
         'defaults': {
             'wall_thickness_mm': 9.0,
             'pipe_radius_m': 1.20,
+            'wheel_diameter_mm': 100.0,
             'pipe_center_z': 2.00,
             'spawn_x': -1.99,
             'spawn_y': 1.29,
             'spawn_z': 2.00,
-            'spawn_roll': -1.5708,
-            'spawn_pitch': 1.5708,
-            'spawn_yaw': 0.0,
+            'spawn_roll': 0.0,
+            'spawn_pitch': -1.5708,
+            'spawn_yaw': -1.5708,
             'approach_theta_deg': 0.0,
-            'side_start_theta_deg': 0.0,
+            'side_start_theta_deg': 90.0,
+            'side_start_heading_deg': 180.0,
             'startup_side_hold_s': 15.0,
             'attachment_guard_method': 'wrench',
             'robot_mass_kg': 25.0,
@@ -666,6 +668,7 @@ class DashboardWindow(QWidget):
 
         self.thickness = self._spin(1.0, 40.0, 9.0, 0.1)
         self.pipe_radius = self._spin(0.0, 5.0, 1.2, 0.01)
+        self.wheel_diameter = self._spin(50.0, 200.0, 100.0, 10.0)
         self.spawn_x = self._spin(-10.0, 10.0, -2.0, 0.01)
         self.spawn_y = self._spin(-10.0, 10.0, -1.75, 0.01)
         self.spawn_z = self._spin(-2.0, 10.0, 0.0, 0.01)
@@ -673,15 +676,20 @@ class DashboardWindow(QWidget):
         self.spawn_pitch = self._spin(-3.1416, 3.1416, 0.0, 0.01)
         self.spawn_yaw = self._spin(-3.1416, 3.1416, 1.5708, 0.01)
         self.robot_mass = self._spin(1.0, 80.0, 25.0, 0.5)
+        self.start_theta = self._spin(-180.0, 180.0, 90.0, 1.0)
+        self.start_heading = self._spin(-180.0, 180.0, 180.0, 1.0)
         self.target_angle = self._spin(-180.0, 180.0, 90.0, 1.0)
         for widget in (
-                self.thickness, self.pipe_radius, self.spawn_x, self.spawn_y,
+                self.thickness, self.pipe_radius, self.wheel_diameter,
+                self.spawn_x, self.spawn_y,
                 self.spawn_z, self.spawn_roll, self.spawn_pitch,
-                self.spawn_yaw, self.robot_mass, self.target_angle):
+                self.spawn_yaw, self.robot_mass, self.start_theta,
+                self.start_heading, self.target_angle):
             widget.valueChanged.connect(self._update_command)
 
         form.addRow('Thickness mm', self.thickness)
         form.addRow('Pipe radius m', self.pipe_radius)
+        form.addRow('Wheel diameter mm', self.wheel_diameter)
         form.addRow('Spawn X m', self.spawn_x)
         form.addRow('Spawn Y m', self.spawn_y)
         form.addRow('Spawn Z m', self.spawn_z)
@@ -689,6 +697,8 @@ class DashboardWindow(QWidget):
         form.addRow('Spawn pitch rad', self.spawn_pitch)
         form.addRow('Spawn yaw rad', self.spawn_yaw)
         form.addRow('Robot mass kg', self.robot_mass)
+        form.addRow('Pipe spawn theta deg', self.start_theta)
+        form.addRow('Spawn heading deg', self.start_heading)
         form.addRow('Pipe target deg', self.target_angle)
         scenario_group.setLayout(form)
 
@@ -1002,7 +1012,7 @@ class DashboardWindow(QWidget):
         spin.setRange(low, high)
         spin.setValue(value)
         spin.setSingleStep(step)
-        spin.setDecimals(4 if step < 0.01 else 2)
+        spin.setDecimals(4 if step < 0.01 else 3 if step < 0.1 else 2)
         return spin
 
     @staticmethod
@@ -1036,6 +1046,7 @@ class DashboardWindow(QWidget):
         return {
             'wall_thickness_mm': self.thickness.value(),
             'pipe_radius_m': self.pipe_radius.value(),
+            'wheel_diameter_mm': self.wheel_diameter.value(),
             'spawn_x': self.spawn_x.value(),
             'spawn_y': self.spawn_y.value(),
             'spawn_z': self.spawn_z.value(),
@@ -1043,12 +1054,15 @@ class DashboardWindow(QWidget):
             'spawn_pitch': self.spawn_pitch.value(),
             'spawn_yaw': self.spawn_yaw.value(),
             'robot_mass_kg': self.robot_mass.value(),
+            'side_start_theta_deg': self.start_theta.value(),
+            'side_start_heading_deg': self.start_heading.value(),
             'target_angle_deg': self.target_angle.value(),
         }
 
     def _apply_pose_dict(self, pose):
         self.thickness.setValue(float(pose.get('wall_thickness_mm', self.thickness.value())))
         self.pipe_radius.setValue(float(pose.get('pipe_radius_m', self.pipe_radius.value())))
+        self.wheel_diameter.setValue(float(pose.get('wheel_diameter_mm', self.wheel_diameter.value())))
         self.spawn_x.setValue(float(pose.get('spawn_x', self.spawn_x.value())))
         self.spawn_y.setValue(float(pose.get('spawn_y', self.spawn_y.value())))
         self.spawn_z.setValue(float(pose.get('spawn_z', self.spawn_z.value())))
@@ -1056,6 +1070,8 @@ class DashboardWindow(QWidget):
         self.spawn_pitch.setValue(float(pose.get('spawn_pitch', self.spawn_pitch.value())))
         self.spawn_yaw.setValue(float(pose.get('spawn_yaw', self.spawn_yaw.value())))
         self.robot_mass.setValue(float(pose.get('robot_mass_kg', self.robot_mass.value())))
+        self.start_theta.setValue(float(pose.get('side_start_theta_deg', self.start_theta.value())))
+        self.start_heading.setValue(float(pose.get('side_start_heading_deg', self.start_heading.value())))
         self.target_angle.setValue(float(pose.get('target_angle_deg', self.target_angle.value())))
         self._update_command()
 
@@ -1198,32 +1214,28 @@ class DashboardWindow(QWidget):
         mode = preset['mode']
         args = ['run_sim:=true', 'use_rviz:=true']
         if mode in ('horizontal_pipe', 'vertical_pipe', 'mockup'):
-            spawn = preset['defaults'] if mode == 'horizontal_pipe' else None
-            spawn_x = self.spawn_x.value() if spawn is None else float(spawn['spawn_x'])
-            spawn_y = self.spawn_y.value() if spawn is None else float(spawn['spawn_y'])
-            spawn_z = self.spawn_z.value() if spawn is None else float(spawn['spawn_z'])
-            spawn_roll = self.spawn_roll.value() if spawn is None else float(spawn['spawn_roll'])
-            spawn_pitch = self.spawn_pitch.value() if spawn is None else float(spawn['spawn_pitch'])
-            spawn_yaw = self.spawn_yaw.value() if spawn is None else float(spawn['spawn_yaw'])
             args.append(f'wall_thickness_mm:={self.thickness.value():.2f}')
             args.append(f'pipe_radius_m:={self.pipe_radius.value():.3f}')
-            args.append(f'spawn_x:={spawn_x:.3f}')
-            args.append(f'spawn_y:={spawn_y:.3f}')
-            args.append(f'spawn_z:={spawn_z:.3f}')
-            args.append(f'spawn_roll:={spawn_roll:.4f}')
-            args.append(f'spawn_pitch:={spawn_pitch:.4f}')
-            args.append(f'spawn_yaw:={spawn_yaw:.4f}')
+            args.append(f'wheel_diameter_mm:={self.wheel_diameter.value():.1f}')
+            args.append(f'spawn_x:={self.spawn_x.value():.3f}')
+            args.append(f'spawn_y:={self.spawn_y.value():.3f}')
+            args.append(f'spawn_z:={self.spawn_z.value():.3f}')
+            args.append(f'spawn_roll:={self.spawn_roll.value():.4f}')
+            args.append(f'spawn_pitch:={self.spawn_pitch.value():.4f}')
+            args.append(f'spawn_yaw:={self.spawn_yaw.value():.4f}')
             args.append(f'robot_mass_kg:={self.robot_mass.value():.2f}')
         if mode == 'horizontal_pipe':
             args.append('use_gazebo_gui:=true')
             args.append('use_pipe_planner:=true')
+            args.append('auto_side_spawn:=true')
             pipe_center_z = float(preset['defaults'].get(
                 'pipe_center_z', self.pipe_radius.value()))
             args.append(f'pipe_center_z:={pipe_center_z:.3f}')
             args.append(
                 f'approach_theta_deg:={preset["defaults"].get("approach_theta_deg", 0.0):.1f}')
-            args.append(
-                f'side_start_theta_deg:={preset["defaults"].get("side_start_theta_deg", 0.0):.1f}')
+            args.append('spawn_location:=custom')
+            args.append(f'side_start_theta_deg:={self.start_theta.value():.1f}')
+            args.append(f'side_start_heading_deg:={self.start_heading.value():.1f}')
             args.append(
                 f'startup_side_hold_s:={preset["defaults"].get("startup_side_hold_s", 15.0):.1f}')
             args.append(
